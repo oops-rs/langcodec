@@ -5,6 +5,7 @@ mod convert;
 mod debug;
 mod diff;
 mod edit;
+mod editor;
 mod formats;
 mod merge;
 mod normalize;
@@ -21,6 +22,7 @@ mod view;
 
 use crate::annotate::{AnnotateOptions, run_annotate_command};
 use crate::convert::{ConvertOptions, run_unified_convert_command, try_custom_format_view};
+use crate::editor::{BrowseOptions, run_browse_command};
 use crate::debug::run_debug_command;
 use crate::diff::{DiffOptions, run_diff_command};
 use crate::edit::{EditSetOptions, run_edit_set_command};
@@ -384,6 +386,28 @@ enum Commands {
     Tolgee {
         #[command(subcommand)]
         command: TolgeeCommands,
+    },
+
+    /// Interactive TUI browser for localization files.
+    ///
+    /// Opens an interactive terminal editor to view, search, and edit
+    /// localization keys and translations without an IDE.
+    ///
+    /// Key bindings:
+    ///   j/↓ k/↑      Navigate keys
+    ///   Tab/Shift+Tab  Select language
+    ///   /              Enter search mode
+    ///   e              Edit selected translation
+    ///   s              Save changes
+    ///   q              Quit (prompts if unsaved changes)
+    #[command(verbatim_doc_comment)]
+    Browse {
+        /// Localization file to open (.xcstrings, .strings, .xml, .xliff, .csv, .tsv)
+        #[arg(short, long)]
+        input: String,
+        /// Language hint (required for single-language formats like .strings)
+        #[arg(short, long)]
+        lang: Option<String>,
     },
 
     /// Debug: Read a localization file and output as JSON.
@@ -1059,6 +1083,15 @@ fn main() {
                 eprintln!(
                     "{}",
                     ui::status_line_stderr(ui::Tone::Error, &format!("Annotate failed: {}", e),)
+                );
+                std::process::exit(1);
+            }
+        }
+        Commands::Browse { input, lang } => {
+            if let Err(e) = run_browse_command(BrowseOptions { input, lang }) {
+                eprintln!(
+                    "{}",
+                    ui::status_line_stderr(ui::Tone::Error, &format!("Browse failed: {}", e))
                 );
                 std::process::exit(1);
             }
