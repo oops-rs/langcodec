@@ -87,6 +87,8 @@ pub fn run_browse_command(opts: BrowseOptions) -> Result<(), String> {
 
     let mut term = TermGuard::new()?;
 
+    let mut prev_key_idx = app.key_list_state.selected();
+
     loop {
         term.terminal
             .draw(|frame| ui::render(frame, &mut app))
@@ -98,6 +100,13 @@ pub fn run_browse_command(opts: BrowseOptions) -> Result<(), String> {
             let event = read().map_err(|e| format!("Input read error: {e}"))?;
             if let HandlerResult::Quit = handle_event(&mut app, event) {
                 break;
+            }
+            // Force full repaint when key selection changes to clear complex-script
+            // glyph artifacts that ratatui's diff renderer leaves behind.
+            let cur_key_idx = app.key_list_state.selected();
+            if cur_key_idx != prev_key_idx {
+                prev_key_idx = cur_key_idx;
+                term.terminal.clear().ok();
             }
         }
     }

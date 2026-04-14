@@ -23,18 +23,29 @@ fn handle_key(app: &mut App, key: KeyEvent) -> HandlerResult {
         InputMode::Search => handle_search(app, key),
         InputMode::Edit => handle_edit(app, key),
         InputMode::ConfirmQuit => handle_confirm_quit(app, key),
+        InputMode::Help => handle_help(app, key),
+        InputMode::ConfirmDelete => handle_confirm_delete(app, key),
     }
 }
 
 fn handle_normal(app: &mut App, key: KeyEvent) -> HandlerResult {
     match key.code {
-        // Key list navigation
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.key_next();
+        // Translation panel scroll — Alt+Down / Alt+Up or Shift+J / Shift+K
+        // These must come before the plain Down/Up/j/k arms to avoid being swallowed.
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+            app.translation_scroll_down();
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.key_prev();
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+            app.translation_scroll_up();
         }
+        KeyCode::Char('J') => {
+            app.translation_scroll_down();
+        }
+        KeyCode::Char('K') => {
+            app.translation_scroll_up();
+        }
+
+        // Page navigation — must come before plain j/k to avoid swallowing Ctrl+d/u
         KeyCode::PageDown | KeyCode::Char('d')
             if key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
@@ -45,11 +56,27 @@ fn handle_normal(app: &mut App, key: KeyEvent) -> HandlerResult {
         {
             app.key_prev_page(10);
         }
+
+        // Key list navigation
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.key_next();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.key_prev();
+        }
         KeyCode::Char('g') => {
             app.key_jump_top();
         }
         KeyCode::Char('G') => {
             app.key_jump_bottom();
+        }
+
+        // Missing-translation navigation
+        KeyCode::Char(']') => {
+            app.next_missing();
+        }
+        KeyCode::Char('[') => {
+            app.prev_missing();
         }
 
         // Language selection in translations panel
@@ -58,6 +85,14 @@ fn handle_normal(app: &mut App, key: KeyEvent) -> HandlerResult {
         }
         KeyCode::BackTab => {
             app.lang_prev();
+        }
+
+        // Panel resize
+        KeyCode::Char('<') => {
+            app.split_narrower();
+        }
+        KeyCode::Char('>') => {
+            app.split_wider();
         }
 
         // Enter search mode
@@ -69,6 +104,28 @@ fn handle_normal(app: &mut App, key: KeyEvent) -> HandlerResult {
         // Enter edit mode for selected lang
         KeyCode::Char('e') | KeyCode::Enter => {
             app.enter_edit_mode();
+        }
+
+        // Undo
+        KeyCode::Char('u') => {
+            app.undo();
+        }
+
+        // Cycle filter mode
+        KeyCode::Char('F') => {
+            app.cycle_filter_mode();
+        }
+
+        // Delete selected key (with confirmation)
+        KeyCode::Char('D') => {
+            app.confirm_delete = true;
+            app.input_mode = InputMode::ConfirmDelete;
+        }
+
+        // Help overlay
+        KeyCode::Char('?') => {
+            app.show_help = true;
+            app.input_mode = InputMode::Help;
         }
 
         // Save
@@ -130,22 +187,61 @@ fn handle_search(app: &mut App, key: KeyEvent) -> HandlerResult {
 
 fn handle_edit(app: &mut App, key: KeyEvent) -> HandlerResult {
     match key.code {
+        KeyCode::Left => {
+            app.cursor_move_left();
+        }
+        KeyCode::Right => {
+            app.cursor_move_right();
+        }
+        KeyCode::Home => {
+            app.cursor_home();
+        }
+        KeyCode::End => {
+            app.cursor_end();
+        }
+        KeyCode::Backspace => {
+            app.edit_backspace();
+        }
+        KeyCode::Delete => {
+            app.edit_delete_forward();
+        }
         KeyCode::Enter => {
             app.commit_edit();
         }
         KeyCode::Esc => {
             app.cancel_edit();
         }
-        KeyCode::Backspace => {
-            app.edit_buffer.pop();
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            match c {
+                'a' | 'A' => app.cursor_home(),
+                'e' | 'E' => app.cursor_end(),
+                'y' | 'Y' => app.copy_from_source_lang(),
+                'c' | 'C' | 'd' | 'D' => app.cancel_edit(),
+                _ => {}
+            }
         }
         KeyCode::Char(c) => {
-            // Honour Ctrl+C/Ctrl+D as cancel
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                app.cancel_edit();
-            } else {
-                app.edit_buffer.push(c);
-            }
+            app.edit_insert(c);
+        }
+        _ => {}
+    }
+    HandlerResult::Continue
+}
+
+fn handle_help(app: &mut App, _key: KeyEvent) -> HandlerResult {
+    app.show_help = false;
+    app.input_mode = InputMode::Normal;
+    HandlerResult::Continue
+}
+
+fn handle_confirm_delete(app: &mut App, key: KeyEvent) -> HandlerResult {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            app.confirm_delete_key();
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.confirm_delete = false;
+            app.input_mode = InputMode::Normal;
         }
         _ => {}
     }
