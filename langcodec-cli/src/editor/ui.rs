@@ -115,9 +115,21 @@ fn render_key_list(frame: &mut Frame, app: &mut App, area: Rect) {
 // ── Translations panel ────────────────────────────────────────────────────────
 
 fn render_translations(frame: &mut Frame, app: &App, area: Rect) {
-    // Clear the whole area first to prevent stale cells from complex-script
-    // characters whose terminal display width differs from unicode-width reports.
+    // Clear the whole area first to remove stale characters from previous render.
     frame.render_widget(Clear, area);
+
+    // Force ratatui's diff renderer to re-send every cell in this panel when
+    // the key changes.  We toggle between two invisible styles (BOLD on/off for
+    // spaces) so ratatui sees each cell as "changed" and overwrites any ghost
+    // glyphs left by complex-script characters (Arabic, Bengali, Hindi, …) whose
+    // terminal display width exceeds what unicode-width reports.  Without this,
+    // ratatui's diff skips cells it thinks are unchanged and ghost glyphs persist.
+    let ghost_fix_style = if app.redraw_token {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    frame.buffer_mut().set_style(area, ghost_fix_style);
 
     let in_edit = matches!(app.input_mode, InputMode::Edit);
 

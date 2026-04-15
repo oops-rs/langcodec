@@ -75,6 +75,10 @@ pub struct App {
     pub translation_scroll: u16,
     /// Set to true while waiting for delete confirmation
     pub confirm_delete: bool,
+    /// Toggled on every key navigation; used by the renderer to force
+    /// ratatui's diff to re-send all cells in the translations panel,
+    /// eliminating ghost glyphs from complex-script characters.
+    pub redraw_token: bool,
 }
 
 impl App {
@@ -128,6 +132,7 @@ impl App {
             split_ratio: 38,
             translation_scroll: 0,
             confirm_delete: false,
+            redraw_token: false,
         }
     }
 
@@ -396,6 +401,7 @@ impl App {
             self.dirty = true;
             self.status_message =
                 Some((format!("Deleted key '{key}'"), StatusTone::Success));
+            self.redraw_token = !self.redraw_token;
         }
         self.confirm_delete = false;
         self.input_mode = InputMode::Normal;
@@ -416,6 +422,7 @@ impl App {
                 self.key_list_state.select(Some(idx));
                 self.translation_scroll = 0;
                 self.status_message = None;
+                self.redraw_token = !self.redraw_token;
                 return;
             }
         }
@@ -435,6 +442,7 @@ impl App {
                 self.key_list_state.select(Some(idx));
                 self.translation_scroll = 0;
                 self.status_message = None;
+                self.redraw_token = !self.redraw_token;
                 return;
             }
         }
@@ -468,6 +476,7 @@ impl App {
         self.key_list_state.select(Some(next));
         self.translation_scroll = 0;
         self.status_message = None;
+        self.redraw_token = !self.redraw_token;
     }
 
     pub fn key_prev(&mut self) {
@@ -482,6 +491,7 @@ impl App {
         self.key_list_state.select(Some(prev));
         self.translation_scroll = 0;
         self.status_message = None;
+        self.redraw_token = !self.redraw_token;
     }
 
     pub fn key_next_page(&mut self, page_size: usize) {
@@ -497,6 +507,7 @@ impl App {
         self.key_list_state.select(Some(next));
         self.translation_scroll = 0;
         self.status_message = None;
+        self.redraw_token = !self.redraw_token;
     }
 
     pub fn key_prev_page(&mut self, page_size: usize) {
@@ -511,6 +522,7 @@ impl App {
         self.key_list_state.select(Some(prev));
         self.translation_scroll = 0;
         self.status_message = None;
+        self.redraw_token = !self.redraw_token;
     }
 
     pub fn key_jump_top(&mut self) {
@@ -518,6 +530,7 @@ impl App {
             self.key_list_state.select(Some(0));
             self.translation_scroll = 0;
             self.status_message = None;
+            self.redraw_token = !self.redraw_token;
         }
     }
 
@@ -527,6 +540,7 @@ impl App {
                 .select(Some(self.filtered_keys.len() - 1));
             self.translation_scroll = 0;
             self.status_message = None;
+            self.redraw_token = !self.redraw_token;
         }
     }
 

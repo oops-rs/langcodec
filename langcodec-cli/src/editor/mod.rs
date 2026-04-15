@@ -87,8 +87,6 @@ pub fn run_browse_command(opts: BrowseOptions) -> Result<(), String> {
 
     let mut term = TermGuard::new()?;
 
-    let mut prev_key_idx = app.key_list_state.selected();
-
     loop {
         term.terminal
             .draw(|frame| ui::render(frame, &mut app))
@@ -101,62 +99,8 @@ pub fn run_browse_command(opts: BrowseOptions) -> Result<(), String> {
             if let HandlerResult::Quit = handle_event(&mut app, event) {
                 break;
             }
-            // Complex-script glyphs (Arabic, Bengali, Hindi, …) can render wider
-            // than unicode-width reports, leaving ghost cells that ratatui's diff
-            // renderer won't overwrite.  A full terminal clear fixes this, but it
-            // causes a visible flash on every navigation.  Only clear when the
-            // old or new key actually contains complex-script text.
-            let cur_key_idx = app.key_list_state.selected();
-            if cur_key_idx != prev_key_idx {
-                let old_key = prev_key_idx.and_then(|i| app.filtered_keys.get(i).cloned());
-                let new_key = cur_key_idx.and_then(|i| app.filtered_keys.get(i).cloned());
-                prev_key_idx = cur_key_idx;
-
-                let needs_clear = [old_key, new_key].iter().any(|k| {
-                    k.as_ref().map(|key| {
-                        app.languages.iter().any(|lang| {
-                            app.get_translation(key, lang)
-                                .map(|v| has_complex_scripts(&v))
-                                .unwrap_or(false)
-                        })
-                    }).unwrap_or(false)
-                });
-
-                if needs_clear {
-                    term.terminal.clear().ok();
-                }
-            }
         }
     }
 
     Ok(())
-}
-
-/// Returns true if the string contains characters from scripts whose glyphs
-/// commonly render wider than unicode-width predicts (Arabic, Devanagari,
-/// Bengali, Tamil, Thai, Gujarati, Gurmukhi, Kannada, Malayalam, Telugu, …).
-/// Used to decide whether a full terminal clear is needed to avoid artifacts.
-fn has_complex_scripts(s: &str) -> bool {
-    s.chars().any(|c| {
-        let cp = c as u32;
-        matches!(cp,
-            0x0600..=0x06FF  // Arabic
-            | 0x0750..=0x077F // Arabic Supplement
-            | 0xFB50..=0xFDFF // Arabic Pres. Forms-A
-            | 0xFE70..=0xFEFF // Arabic Pres. Forms-B
-            | 0x0900..=0x097F // Devanagari (Hindi, Marathi, …)
-            | 0x0980..=0x09FF // Bengali / Assamese
-            | 0x0A00..=0x0A7F // Gurmukhi (Punjabi)
-            | 0x0A80..=0x0AFF // Gujarati
-            | 0x0B00..=0x0B7F // Odia
-            | 0x0B80..=0x0BFF // Tamil
-            | 0x0C00..=0x0C7F // Telugu
-            | 0x0C80..=0x0CFF // Kannada
-            | 0x0D00..=0x0D7F // Malayalam
-            | 0x0E00..=0x0E7F // Thai
-            | 0x0E80..=0x0EFF // Lao
-            | 0x0F00..=0x0FFF // Tibetan
-            | 0x1000..=0x109F // Myanmar
-        )
-    })
 }
