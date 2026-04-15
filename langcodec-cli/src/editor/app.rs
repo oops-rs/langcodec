@@ -386,12 +386,13 @@ impl App {
         };
         let mut had_error = false;
         for lang in self.languages.clone() {
-            if self.codec.has_entry(&key, &lang) {
-                if let Err(e) = self.codec.remove_entry(&key, &lang) {
-                    self.status_message = Some((format!("Delete failed: {e}"), StatusTone::Error));
-                    had_error = true;
-                    break;
-                }
+            if !self.codec.has_entry(&key, &lang) {
+                continue;
+            }
+            if let Err(e) = self.codec.remove_entry(&key, &lang) {
+                self.status_message = Some((format!("Delete failed: {e}"), StatusTone::Error));
+                had_error = true;
+                break;
             }
         }
         if !had_error {
