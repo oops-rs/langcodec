@@ -1,6 +1,6 @@
 [package]
 name = "langcodec-cli"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 description = "A universal CLI tool for converting and inspecting localization files (Apple, Android, CSV, etc.)"
 license = "MIT"
@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "internationalization", "localization"]
 documentation = "https://docs.rs/langcodec-cli"
 
 [dependencies]
-langcodec = { path = "../langcodec", version = "0.11.0" }
+langcodec = { path = "../langcodec", version = "0.12.0" }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 unicode-width = "0.2.0"
