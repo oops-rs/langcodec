@@ -3,6 +3,7 @@ Cargo.lock
 
 # Editor Configurations
 .vscode
+.claude
 
 # Local planning artifacts
 docs/plans/*
