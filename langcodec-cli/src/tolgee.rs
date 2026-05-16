@@ -11,7 +11,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::config::{LoadedConfig, TolgeeConfig, load_config, resolve_config_relative_path};
+use crate::config::{
+    LoadedConfig, TolgeeConfig, UserConfig, load_config, load_user_config,
+    resolve_config_relative_path,
+};
 
 const DEFAULT_TOLGEE_CONFIG: &str = ".tolgeerc.json";
 const TOLGEE_FORMAT_APPLE_XCSTRINGS: &str = "APPLE_XCSTRINGS";
@@ -69,6 +72,7 @@ struct TolgeeProject {
     config_path: PathBuf,
     project_root: PathBuf,
     raw: Value,
+    user_api_key: Option<String>,
     pull_template: String,
     mappings: Vec<TolgeeMappedFile>,
 }
@@ -432,13 +436,57 @@ fn build_tolgee_project_from_raw(
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_PULL_TEMPLATE)
         .to_string();
+    let user_api_key = resolve_tolgee_user_api_key(&raw)?;
 
     Ok(TolgeeProject {
         config_path,
         project_root,
         raw,
+        user_api_key,
         pull_template,
         mappings,
+    })
+}
+
+fn resolve_tolgee_user_api_key(raw: &Value) -> Result<Option<String>, String> {
+    if tolgee_has_project_api_key(raw) {
+        return Ok(None);
+    }
+
+    let Some(user_config) = load_user_config()? else {
+        return Ok(None);
+    };
+    Ok(resolve_tolgee_user_api_key_from_config(
+        raw,
+        Some(&user_config.data),
+    ))
+}
+
+fn resolve_tolgee_user_api_key_from_config(
+    raw: &Value,
+    user_config: Option<&UserConfig>,
+) -> Option<String> {
+    if tolgee_has_project_api_key(raw) {
+        return None;
+    }
+
+    user_config.and_then(|config| {
+        config
+            .tolgee
+            .api_key_for_project(tolgee_project_id(raw))
+            .map(str::to_string)
+    })
+}
+
+fn tolgee_has_project_api_key(raw: &Value) -> bool {
+    raw.get("apiKey").is_some()
+}
+
+fn tolgee_project_id(raw: &Value) -> Option<u64> {
+    raw.get("projectId").and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
     })
 }
 
@@ -614,6 +662,10 @@ fn invoke_tolgee(
             command
         }
     };
+
+    if let Some(api_key) = &project.user_api_key {
+        command.env("TOLGEE_API_KEY", api_key);
+    }
 
     let output = command
         .arg("--config")
@@ -982,6 +1034,7 @@ mod tests {
             config_path: PathBuf::from("/tmp/.tolgeerc.json"),
             project_root: PathBuf::from("/tmp"),
             raw: json!({}),
+            user_api_key: None,
             pull_template: "/{namespace}/{languageTag}.{extension}".to_string(),
             mappings: Vec::new(),
         };
@@ -1071,5 +1124,40 @@ file_structure_template = "/{namespace}/Localizable.{extension}"
         let project = load_tolgee_project_from_json(config_path).unwrap();
         assert_eq!(project.raw["push"]["languages"], json!(["en"]));
         assert!(project.raw["push"].get("language").is_none());
+    }
+
+    #[test]
+    fn resolves_tolgee_credentials_by_precedence() {
+        let user_config: UserConfig = toml::from_str(
+            r#"
+[tolgee]
+api_key = "tgpak_user_global"
+
+[tolgee.projects.36]
+api_key = "tgpak_user_project"
+"#,
+        )
+        .unwrap();
+
+        let project_key = resolve_tolgee_user_api_key_from_config(
+            &json!({
+                "projectId": 36,
+                "apiKey": "tgpak_project"
+            }),
+            Some(&user_config),
+        );
+        assert_eq!(project_key, None);
+
+        let user_project_key = resolve_tolgee_user_api_key_from_config(
+            &json!({ "projectId": 36 }),
+            Some(&user_config),
+        );
+        assert_eq!(user_project_key.as_deref(), Some("tgpak_user_project"));
+
+        let user_global_key = resolve_tolgee_user_api_key_from_config(
+            &json!({ "projectId": 37 }),
+            Some(&user_config),
+        );
+        assert_eq!(user_global_key.as_deref(), Some("tgpak_user_global"));
     }
 }

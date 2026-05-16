@@ -52,6 +52,7 @@ if [ -z "$config" ] || [ -z "$subcommand" ]; then
 fi
 
 echo "$subcommand|$config" >> "{log_path}"
+echo "env|${{TOLGEE_API_KEY-}}" >> "{log_path}"
 cp "$config" "{capture_path}"
 
 if [ "$subcommand" = "push" ]; then
@@ -145,6 +146,41 @@ file_structure_template = "/{{namespace}}/Localizable.{{extension}}"
         ),
     )
     .unwrap();
+    config_path
+}
+
+fn write_langcodec_tolgee_config_without_api_key(project_root: &Path, file_path: &str) -> PathBuf {
+    let config_path = project_root.join("langcodec.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"[tolgee]
+project_id = 36
+api_url = "https://tolgee.example/api"
+namespaces = ["Core"]
+
+[tolgee.push]
+languages = ["en"]
+force_mode = "KEEP"
+
+[[tolgee.push.files]]
+path = "{file_path}"
+namespace = "Core"
+
+[tolgee.pull]
+path = "./tolgee-temp"
+file_structure_template = "/{{namespace}}/Localizable.{{extension}}"
+"#
+        ),
+    )
+    .unwrap();
+    config_path
+}
+
+fn write_user_tolgee_config(config_home: &Path, contents: &str) -> PathBuf {
+    let config_path = config_home.join("langcodec").join("config.toml");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    fs::write(&config_path, contents).unwrap();
     config_path
 }
 
@@ -373,6 +409,142 @@ fn tolgee_pull_uses_langcodec_toml_without_tolgeerc_json() {
     let captured = fs::read_to_string(&capture).unwrap();
     assert!(captured.contains("\"projectId\""));
     assert!(captured.contains("\"apiUrl\""));
+    assert!(captured.contains("\"tgpak_example\""));
     assert!(captured.contains("\"push\""));
     assert!(captured.contains("\"pull\""));
+}
+
+#[test]
+fn tolgee_user_project_api_key_is_passed_via_env_not_overlay() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project");
+    fs::create_dir_all(&project_root).unwrap();
+    let config_home = temp_dir.path().join("xdg");
+    let local_catalog = project_root.join("Localizable.xcstrings");
+    let payload = project_root.join("pull_payload.xcstrings");
+    let capture = project_root.join("captured_config.json");
+    let log = project_root.join("tolgee.log");
+
+    write_local_catalog(&local_catalog);
+    write_pulled_payload(&payload, false);
+    write_langcodec_tolgee_config_without_api_key(&project_root, "Localizable.xcstrings");
+    write_user_tolgee_config(
+        &config_home,
+        r#"[tolgee]
+api_key = "tgpak_user_global"
+
+[tolgee.projects.36]
+api_key = "tgpak_user_project"
+"#,
+    );
+    write_fake_tolgee(&project_root, &payload, &capture, &log);
+
+    let output = langcodec_cmd()
+        .current_dir(&project_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("TOLGEE_API_KEY", "tgpak_env_should_not_win")
+        .args(["tolgee", "push", "--namespace", "Core"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log_contents = fs::read_to_string(&log).unwrap();
+    assert!(log_contents.contains("env|tgpak_user_project"));
+
+    let captured = fs::read_to_string(&capture).unwrap();
+    assert!(captured.contains("\"namespaces\""));
+    assert!(!captured.contains("tgpak_user_project"));
+    assert!(!captured.contains("tgpak_user_global"));
+    assert!(!captured.contains("\"apiKey\""));
+}
+
+#[test]
+fn tolgee_project_api_key_wins_over_user_config() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project");
+    fs::create_dir_all(&project_root).unwrap();
+    let config_home = temp_dir.path().join("xdg");
+    let local_catalog = project_root.join("Localizable.xcstrings");
+    let payload = project_root.join("pull_payload.xcstrings");
+    let capture = project_root.join("captured_config.json");
+    let log = project_root.join("tolgee.log");
+
+    write_local_catalog(&local_catalog);
+    write_pulled_payload(&payload, false);
+    write_langcodec_tolgee_config(&project_root, "Localizable.xcstrings");
+    write_user_tolgee_config(
+        &config_home,
+        r#"[tolgee]
+api_key = "tgpak_user_global"
+
+[tolgee.projects.36]
+api_key = "tgpak_user_project"
+"#,
+    );
+    write_fake_tolgee(&project_root, &payload, &capture, &log);
+
+    let output = langcodec_cmd()
+        .current_dir(&project_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env_remove("TOLGEE_API_KEY")
+        .args(["tolgee", "push", "--namespace", "Core"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log_contents = fs::read_to_string(&log).unwrap();
+    assert!(log_contents.contains("env|\n"));
+
+    let captured = fs::read_to_string(&capture).unwrap();
+    assert!(captured.contains("tgpak_example"));
+    assert!(!captured.contains("tgpak_user_project"));
+    assert!(!captured.contains("tgpak_user_global"));
+}
+
+#[test]
+fn tolgee_env_api_key_remains_fallback_without_user_config() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project");
+    fs::create_dir_all(&project_root).unwrap();
+    let config_home = temp_dir.path().join("empty-xdg");
+    fs::create_dir_all(&config_home).unwrap();
+    let local_catalog = project_root.join("Localizable.xcstrings");
+    let payload = project_root.join("pull_payload.xcstrings");
+    let capture = project_root.join("captured_config.json");
+    let log = project_root.join("tolgee.log");
+
+    write_local_catalog(&local_catalog);
+    write_pulled_payload(&payload, false);
+    let config = write_tolgee_config(&project_root, "Localizable.xcstrings");
+    write_fake_tolgee(&project_root, &payload, &capture, &log);
+
+    let output = langcodec_cmd()
+        .current_dir(&project_root)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("TOLGEE_API_KEY", "tgpak_env_fallback")
+        .args(["tolgee", "push", "--config", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log_contents = fs::read_to_string(&log).unwrap();
+    assert!(log_contents.contains("env|tgpak_env_fallback"));
 }
