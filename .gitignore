@@ -7,3 +7,9 @@ Cargo.lock
 
 # Local planning artifacts
 docs/plans/*
+
+# Agentic assets
+.nodus
+nodus.lock
+
+opencode.json

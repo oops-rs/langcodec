@@ -1,0 +1,4 @@
+[adapters]
+enabled = ["claude", "opencode"]
+[dev-dependencies]
+ena = { github = "oops-rs/ena", branch = "main" }
