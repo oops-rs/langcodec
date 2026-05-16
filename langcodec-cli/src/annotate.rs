@@ -267,16 +267,17 @@ fn run_annotate_with_backend(
 
     for request in &requests {
         match results.get(&request.key) {
-            Some(Some(annotation)) => {
+            Some(Some(annotation))
                 if apply_annotation(
                     &mut codec,
                     annotation_format,
                     &request.key,
                     &annotation.comment,
-                )? {
-                    changed += 1;
-                }
+                )? =>
+            {
+                changed += 1;
             }
+            Some(Some(_)) => {}
             Some(None) => unmatched += 1,
             None => {}
         }

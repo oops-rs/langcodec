@@ -122,51 +122,36 @@ pub fn detect_custom_format(file_path: &str, file_content: &str) -> Option<Custo
         .to_lowercase();
 
     match extension.as_str() {
-        "langcodec" => {
-            // Try to parse as JSON array of Resource objects
-            if serde_json::from_str::<Vec<serde_json::Value>>(file_content).is_ok() {
-                // Check if it looks like an array of Resource objects
-                if let Ok(array) = serde_json::from_str::<Vec<serde_json::Value>>(file_content)
-                    && !array.is_empty()
-                {
-                    // Check if the first element has the expected Resource structure
-                    if let Some(first) = array.first()
-                        && let Some(obj) = first.as_object()
-                        && obj.contains_key("metadata")
-                        && obj.contains_key("entries")
-                    {
-                        return Some(CustomFormat::LangcodecResourceArray);
-                    }
-                }
-            }
+        "langcodec" if is_langcodec_resource_array(file_content) => {
+            Some(CustomFormat::LangcodecResourceArray)
         }
-        "json" => {
-            // Try to parse as JSON object first (JSONLanguageMap)
-            if serde_json::from_str::<serde_json::Value>(file_content).is_ok() {
-                // Check if it's an object (not an array)
-                if let Ok(obj) = serde_json::from_str::<
-                    std::collections::HashMap<String, serde_json::Value>,
-                >(file_content)
-                    && !obj.is_empty()
-                {
-                    return Some(CustomFormat::JSONLanguageMap);
-                }
-                // Check if it's an array (JSONArrayLanguageMap)
-                if serde_json::from_str::<Vec<serde_json::Value>>(file_content).is_ok() {
-                    return Some(CustomFormat::JSONArrayLanguageMap);
-                }
-            }
+        "json" if is_json_language_map(file_content) => Some(CustomFormat::JSONLanguageMap),
+        "json" if serde_json::from_str::<Vec<serde_json::Value>>(file_content).is_ok() => {
+            Some(CustomFormat::JSONArrayLanguageMap)
         }
-        "yaml" | "yml" => {
-            // Try to parse as YAML
-            if serde_yaml::from_str::<serde_yaml::Value>(file_content).is_ok() {
-                return Some(CustomFormat::YAMLLanguageMap);
-            }
+        "yaml" | "yml" if serde_yaml::from_str::<serde_yaml::Value>(file_content).is_ok() => {
+            Some(CustomFormat::YAMLLanguageMap)
         }
-        _ => {}
+        _ => None,
     }
+}
 
-    None
+fn is_langcodec_resource_array(file_content: &str) -> bool {
+    let Ok(array) = serde_json::from_str::<Vec<serde_json::Value>>(file_content) else {
+        return false;
+    };
+    let Some(first) = array.first() else {
+        return false;
+    };
+
+    first
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("metadata") && obj.contains_key("entries"))
+}
+
+fn is_json_language_map(file_content: &str) -> bool {
+    serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(file_content)
+        .is_ok_and(|obj| !obj.is_empty())
 }
 
 /// Validate custom format file content
