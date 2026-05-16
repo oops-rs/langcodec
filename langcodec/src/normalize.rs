@@ -67,9 +67,7 @@ fn normalize_codec_in_place(
                 transformed_ids.push(transformed);
             }
 
-            for (entry, transformed_id) in
-                resource.entries.iter_mut().zip(transformed_ids.into_iter())
-            {
+            for (entry, transformed_id) in resource.entries.iter_mut().zip(transformed_ids) {
                 if entry.id != transformed_id {
                     entry.id = transformed_id;
                     changed = true;
