@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
+use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::{BufRead, Write},
     str::FromStr,
 };
@@ -24,6 +24,36 @@ where
         out.serialize_entry(k, &map[k])?;
     }
     out.end()
+}
+
+fn serialize_sorted_plural_map<S>(
+    map: &HashMap<PluralCategory, PluralVariation>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut keys: Vec<&PluralCategory> = map.keys().collect();
+    keys.sort_unstable();
+
+    let mut out = serializer.serialize_map(Some(map.len()))?;
+    for k in keys {
+        out.serialize_entry(k, &map[k])?;
+    }
+    out.end()
+}
+
+fn serialize_optional_sorted_plural_map<S>(
+    map: &Option<HashMap<PluralCategory, PluralVariation>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match map {
+        Some(map) => serialize_sorted_plural_map(map, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -50,12 +80,19 @@ impl Parser for Format {
 impl TryFrom<Vec<Resource>> for Format {
     type Error = Error;
 
-    fn try_from(resources: Vec<Resource>) -> Result<Self, Self::Error> {
+    fn try_from(mut resources: Vec<Resource>) -> Result<Self, Self::Error> {
         // Key: String ID of the item (e.g. "hello world")
         // Value: Item containing localizations and metadata
         let mut strings = HashMap::<String, Item>::new();
         let mut source_language = String::new();
         let mut version = String::new();
+
+        resources.sort_by(|left, right| {
+            left.metadata
+                .language
+                .cmp(&right.metadata.language)
+                .then_with(|| left.metadata.domain.cmp(&right.metadata.domain))
+        });
 
         for mut resource in resources {
             // source_language
@@ -133,7 +170,7 @@ impl TryFrom<Format> for Vec<Resource> {
     fn try_from(format: Format) -> Result<Self, Self::Error> {
         // Key: Language code, e.g. "en", "fr", etc.
         // Value: Resource containing all items for that language
-        let mut resource_map = HashMap::<String, Resource>::new();
+        let mut resource_map = BTreeMap::<String, Resource>::new();
         let mut pending_empty_translatable_entries =
             Vec::<(String, Option<String>, HashMap<String, String>)>::new();
 
@@ -431,8 +468,13 @@ impl Localization {
                 .plural
                 .as_ref()
                 .and_then(|plural_map| {
-                    plural_map.values().next().and_then(|variation| {
-                        variation.string_unit.as_ref().map(|su| su.state.clone())
+                    let mut keys: Vec<&PluralCategory> = plural_map.keys().collect();
+                    keys.sort_unstable();
+                    keys.into_iter().find_map(|category| {
+                        plural_map
+                            .get(category)
+                            .and_then(|variation| variation.string_unit.as_ref())
+                            .map(|su| su.state.clone())
                     })
                 })
                 .unwrap_or(EntryStatus::Stale)
@@ -460,6 +502,7 @@ impl StringUnit {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Variations {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "serialize_optional_sorted_plural_map")]
     pub plural: Option<HashMap<PluralCategory, PluralVariation>>,
 }
 
@@ -613,16 +656,68 @@ mod tests {
         let files = fmt.strings.get("files").expect("files item");
         let en_p = files.localizations.get("en").expect("en loc");
         let plural_map = en_p.variations.as_ref().unwrap().plural.as_ref().unwrap();
-        assert!(
-            plural_map
-                .get(&PluralCategory::One)
-                .unwrap()
-                .string_unit
-                .as_ref()
-                .unwrap()
-                .value
-                .contains("%1$@")
-        );
+        assert!(plural_map
+            .get(&PluralCategory::One)
+            .unwrap()
+            .string_unit
+            .as_ref()
+            .unwrap()
+            .value
+            .contains("%1$@"));
+    }
+
+    #[test]
+    fn test_plural_variations_serialize_in_category_order() {
+        let fmt = Format {
+            source_language: "en".to_string(),
+            version: "1.0".to_string(),
+            strings: HashMap::from([(
+                "files".to_string(),
+                Item {
+                    localizations: HashMap::from([(
+                        "en".to_string(),
+                        Localization::from(Variations::new(
+                            [
+                                (
+                                    PluralCategory::Other,
+                                    PluralVariation::new(EntryStatus::Translated, "%d files"),
+                                ),
+                                (
+                                    PluralCategory::Zero,
+                                    PluralVariation::new(EntryStatus::Translated, "No files"),
+                                ),
+                                (
+                                    PluralCategory::Many,
+                                    PluralVariation::new(EntryStatus::Translated, "Many files"),
+                                ),
+                                (
+                                    PluralCategory::One,
+                                    PluralVariation::new(EntryStatus::Translated, "One file"),
+                                ),
+                            ]
+                            .into_iter(),
+                        )),
+                    )]),
+                    comment: None,
+                    extraction_state: None,
+                    should_translate: Some(true),
+                    is_comment_auto_generated: None,
+                },
+            )]),
+        };
+
+        let mut out = Vec::new();
+        fmt.to_writer(&mut out).expect("serialize xcstrings");
+        let json = String::from_utf8(out).expect("utf8 json");
+
+        let zero = json.find("\"zero\"").expect("zero category");
+        let one = json.find("\"one\"").expect("one category");
+        let many = json.find("\"many\"").expect("many category");
+        let other = json.find("\"other\"").expect("other category");
+
+        assert!(zero < one);
+        assert!(one < many);
+        assert!(many < other);
     }
 
     #[test]
