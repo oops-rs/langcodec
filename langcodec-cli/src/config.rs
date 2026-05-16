@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -83,6 +84,24 @@ pub struct TolgeePullConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub struct UserConfig {
+    #[serde(default)]
+    pub tolgee: UserTolgeeConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UserTolgeeConfig {
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub projects: HashMap<String, UserTolgeeProjectConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UserTolgeeProjectConfig {
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct TranslateInputConfig {
     pub source: Option<String>,
     pub sources: Option<Vec<String>>,
@@ -120,6 +139,11 @@ pub struct AnnotateConfig {
 pub struct LoadedConfig {
     pub path: PathBuf,
     pub data: CliConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedUserConfig {
+    pub data: UserConfig,
 }
 
 impl LoadedConfig {
@@ -165,6 +189,15 @@ impl TolgeeConfig {
             || !self.push.files.is_empty()
             || self.pull.path.is_some()
             || self.pull.file_structure_template.is_some()
+    }
+}
+
+impl UserTolgeeConfig {
+    pub fn api_key_for_project(&self, project_id: Option<u64>) -> Option<&str> {
+        project_id
+            .and_then(|id| self.projects.get(&id.to_string()))
+            .and_then(|project| project.api_key.as_deref())
+            .or(self.api_key.as_deref())
     }
 }
 
@@ -246,6 +279,18 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<Option<LoadedConfig>, 
     Ok(Some(LoadedConfig { path, data }))
 }
 
+pub fn load_user_config() -> Result<Option<LoadedUserConfig>, String> {
+    let Some(path) = discover_user_config_path() else {
+        return Ok(None);
+    };
+
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read user config '{}': {}", path.display(), e))?;
+    let data: UserConfig = toml::from_str(&text)
+        .map_err(|e| format!("Failed to parse user config '{}': {}", path.display(), e))?;
+    Ok(Some(LoadedUserConfig { data }))
+}
+
 fn discover_config_path() -> Result<Option<PathBuf>, String> {
     let mut current = std::env::current_dir()
         .map_err(|e| format!("Failed to determine current directory: {}", e))?;
@@ -260,6 +305,20 @@ fn discover_config_path() -> Result<Option<PathBuf>, String> {
             return Ok(None);
         }
     }
+}
+
+fn discover_user_config_path() -> Option<PathBuf> {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".config"))
+        })?;
+
+    let candidate = config_home.join("langcodec").join("config.toml");
+    candidate.is_file().then_some(candidate)
 }
 
 pub fn resolve_config_relative_path(config_dir: Option<&Path>, path: &str) -> String {
@@ -564,5 +623,48 @@ namespace = "WebGame"
         .expect("parse config");
 
         assert_eq!(config.tolgee.push.languages, Some(vec!["en".to_string()]));
+    }
+
+    #[test]
+    fn user_config_parses_tolgee_global_api_key() {
+        let config: UserConfig = toml::from_str(
+            r#"
+[tolgee]
+api_key = "tgpak_user_default_key"
+"#,
+        )
+        .expect("parse user config");
+
+        assert_eq!(
+            config.tolgee.api_key.as_deref(),
+            Some("tgpak_user_default_key")
+        );
+        assert_eq!(
+            config.tolgee.api_key_for_project(Some(36)),
+            Some("tgpak_user_default_key")
+        );
+    }
+
+    #[test]
+    fn user_config_parses_tolgee_project_api_key() {
+        let config: UserConfig = toml::from_str(
+            r#"
+[tolgee]
+api_key = "tgpak_user_default_key"
+
+[tolgee.projects.36]
+api_key = "tgpak_project_specific_key"
+"#,
+        )
+        .expect("parse user config");
+
+        assert_eq!(
+            config.tolgee.api_key_for_project(Some(36)),
+            Some("tgpak_project_specific_key")
+        );
+        assert_eq!(
+            config.tolgee.api_key_for_project(Some(37)),
+            Some("tgpak_user_default_key")
+        );
     }
 }
