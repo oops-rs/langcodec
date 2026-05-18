@@ -69,7 +69,7 @@ Use the library:
 
 ```toml
 [dependencies]
-langcodec = "0.11.0"
+langcodec = "0.13.0"
 ```
 
 Try the workflow:

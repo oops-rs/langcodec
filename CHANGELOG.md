@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.13.0] - 2026-05-18
+
+### Added
+
+- Added user-scoped Tolgee credential support with project-specific API key overrides.
+- Added CLI coverage for Tolgee credential resolution through user config.
+
+### Changed
+
+- Serialized `.xcstrings` plural variations in a stable CLDR category order.
+
+### Fixed
+
+- Fixed Tolgee-related Clippy warnings so CI remains clean under denied warnings.
+
+## [0.12.0] - 2026-04-15
+
+### Added
+
+- Added Apple/Xcode XLIFF 1.2 parsing, writing, and conversion support.
+- Added an interactive TUI browser/editor for localization files.
+- Added CLI coverage for XLIFF conversions and merge workflows.
+
+### Changed
+
+- Expanded the release workflow with manual tag dispatch and packaged binary uploads.
+- Added Homebrew tap update automation after GitHub releases.
+- Improved CLI editor navigation and UI behavior.
+
+### Fixed
+
+- Tightened single-language output handling in conversion flows.
+- Skipped Tolgee sync for unmapped catalogs.
+- Fixed release workflow secret handling and Clippy warnings.
+
 ## [0.11.0] - 2026-03-26
 
 ### Added
