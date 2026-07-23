@@ -12,24 +12,24 @@ pub fn expand_input_globs(inputs: &Vec<String>) -> Result<Vec<String>, String> {
         s.bytes().any(|b| matches!(b, b'*' | b'?' | b'[' | b'{'))
     }
 
-    // Extract a static directory prefix before the first glob meta-character
+    // Extract the directory components before the first component containing
+    // glob metadata. A partial component can name an existing directory (for
+    // example, `values` in `values*`), but it is not a safe traversal root
+    // because matching sibling directories such as `values-es` live beside it.
     fn static_prefix_dir(pattern: &str) -> PathBuf {
-        let bytes = pattern.as_bytes();
-        let mut idx = 0usize;
-        while idx < bytes.len() {
-            match bytes[idx] {
-                b'*' | b'?' | b'[' | b'{' => break,
-                _ => idx += 1,
+        let mut root = PathBuf::new();
+
+        for component in Path::new(pattern).components() {
+            if has_glob_meta(&component.as_os_str().to_string_lossy()) {
+                break;
             }
+            root.push(component.as_os_str());
         }
-        let prefix = &pattern[..idx];
-        let p = Path::new(prefix);
-        if p.is_dir() {
-            p.to_path_buf()
+
+        if root.as_os_str().is_empty() {
+            PathBuf::from(".")
         } else {
-            p.parent()
-                .map(|pp| pp.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("."))
+            root
         }
     }
 
@@ -112,4 +112,49 @@ pub fn expand_input_globs(inputs: &Vec<String>) -> Result<Vec<String>, String> {
         }
     }
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::expand_input_globs;
+
+    #[test]
+    fn glob_component_uses_its_parent_as_the_walk_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let values = temp_dir.path().join("res/values/strings.xml");
+        let values_es = temp_dir.path().join("res/values-es/strings.xml");
+        fs::create_dir_all(values.parent().unwrap()).unwrap();
+        fs::create_dir_all(values_es.parent().unwrap()).unwrap();
+        fs::write(&values, "<resources />").unwrap();
+        fs::write(&values_es, "<resources />").unwrap();
+
+        let pattern = format!("{}/res/values*/strings.xml", temp_dir.path().display());
+        let mut expanded = expand_input_globs(&vec![pattern]).unwrap();
+        expanded.sort();
+
+        let mut expected = vec![
+            values.to_string_lossy().into_owned(),
+            values_es.to_string_lossy().into_owned(),
+        ];
+        expected.sort();
+        assert_eq!(expanded, expected);
+    }
+
+    #[test]
+    fn literal_input_behavior_is_unchanged() {
+        let temp_dir = TempDir::new().unwrap();
+        let input = temp_dir.path().join("res/values/strings.xml");
+        fs::create_dir_all(input.parent().unwrap()).unwrap();
+        fs::write(&input, "<resources />").unwrap();
+        let input = input.to_string_lossy().into_owned();
+
+        assert_eq!(
+            expand_input_globs(&vec![input.clone()]).unwrap(),
+            vec![input]
+        );
+    }
 }

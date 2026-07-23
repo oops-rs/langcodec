@@ -673,8 +673,18 @@ pub fn infer_language_from_path<P: AsRef<Path>>(
     // Helper: validate and normalize a language candidate (accepts underscores, normalizes to hyphens)
     fn normalize_lang(candidate: &str) -> Option<String> {
         let canonical = candidate.replace('_', "-");
-        LanguageIdentifier::from_str(&canonical).ok()?;
-        Some(canonical)
+        let language = LanguageIdentifier::from_str(&canonical).ok()?;
+        Some(language.to_string())
+    }
+
+    fn normalize_android_lang(language: String) -> String {
+        match language.as_str() {
+            "in" => "id".to_string(),
+            "tl" => "fil".to_string(),
+            "zh" => "zh-Hans".to_string(),
+            "zh-TW" => "zh-Hant".to_string(),
+            _ => language,
+        }
     }
 
     // Helper: parse Android values- qualifiers into BCP-47 if possible
@@ -686,12 +696,13 @@ pub fn infer_language_from_path<P: AsRef<Path>>(
             }
             if let Some(b_rest) = rest.strip_prefix("b+") {
                 // BCP-47 style encoded in plus-separated tags
-                let parts: Vec<&str> = b_rest.split('+').collect();
+                let locale = b_rest.split('-').next()?;
+                let parts: Vec<&str> = locale.split('+').collect();
                 if parts.is_empty() {
                     return None;
                 }
                 let lang = parts.join("-");
-                return normalize_lang(&lang);
+                return normalize_lang(&lang).map(normalize_android_lang);
             }
             // Legacy qualifiers: lang[-rREGION][-SCRIPT]...
             let mut lang: Option<String> = None;
@@ -704,8 +715,24 @@ pub fn infer_language_from_path<P: AsRef<Path>>(
                     if !r.is_empty() {
                         region = Some(r.to_string());
                     }
-                } else if lang.is_none() {
+                } else if lang.is_none()
+                    && (2..=3).contains(&token.len())
+                    && token
+                        .chars()
+                        .all(|character| character.is_ascii_alphabetic())
+                    && !token.eq_ignore_ascii_case("car")
+                {
                     lang = Some(token.to_string());
+                } else if lang.is_some()
+                    && region.is_none()
+                    && token.len() == 2
+                    && token
+                        .chars()
+                        .all(|character| character.is_ascii_alphabetic())
+                {
+                    // Accept a BCP-47-style region for compatibility with paths such as
+                    // values-zh-TW, in addition to Android's canonical values-zh-rTW.
+                    region = Some(token.to_string());
                 }
             }
             if let Some(l) = lang {
@@ -713,7 +740,7 @@ pub fn infer_language_from_path<P: AsRef<Path>>(
                 if let Some(r) = region {
                     tag = format!("{}-{}", tag, r);
                 }
-                return normalize_lang(&tag);
+                return normalize_lang(&tag).map(normalize_android_lang);
             }
         }
         None
@@ -913,6 +940,73 @@ mod tests {
     use super::*;
     use crate::types::{Entry, EntryStatus, Metadata, Plural, PluralCategory, Translation};
     use std::collections::{BTreeMap, HashMap};
+
+    #[test]
+    fn test_infer_android_values_language_aliases() {
+        let format = FormatType::AndroidStrings(None);
+        let cases = [
+            ("values-in/strings.xml", "id"),
+            ("values-tl/strings.xml", "fil"),
+            ("values-zh/strings.xml", "zh-Hans"),
+            ("values-zh-TW/strings.xml", "zh-Hant"),
+            ("values-zh-rTW/strings.xml", "zh-Hant"),
+            ("values-b+zh+TW/strings.xml", "zh-Hant"),
+        ];
+
+        for (path, expected) in cases {
+            assert_eq!(
+                infer_language_from_path(path, &format).unwrap(),
+                Some(expected.to_string()),
+                "unexpected language inferred from {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_infer_android_values_language_keeps_other_tags_canonical() {
+        let format = FormatType::AndroidStrings(None);
+        let cases = [
+            ("values-zh-rCN/strings.xml", "zh-CN"),
+            ("values-pt-rbr/strings.xml", "pt-BR"),
+            ("values-b+sr+latn+rs/strings.xml", "sr-Latn-RS"),
+            ("values-b+zh+Hant+TW/strings.xml", "zh-Hant-TW"),
+            ("values-es-night/strings.xml", "es"),
+            ("values-in-v21/strings.xml", "id"),
+            ("values-b+zh+Hant+TW-night/strings.xml", "zh-Hant-TW"),
+        ];
+
+        for (path, expected) in cases {
+            assert_eq!(
+                infer_language_from_path(path, &format).unwrap(),
+                Some(expected.to_string()),
+                "unexpected language inferred from {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_infer_android_values_ignores_non_locale_qualifiers() {
+        let format = FormatType::AndroidStrings(None);
+
+        for path in [
+            "values-night/strings.xml",
+            "values-ldrtl/strings.xml",
+            "values-car/strings.xml",
+            "values-v21/strings.xml",
+        ] {
+            assert_eq!(
+                infer_language_from_path(path, &format).unwrap(),
+                None,
+                "unexpected language inferred from {path}"
+            );
+        }
+
+        assert_eq!(
+            infer_language_from_path("zh.lproj/Localizable.strings", &FormatType::Strings(None))
+                .unwrap(),
+            Some("zh".to_string())
+        );
+    }
 
     #[test]
     fn test_convert_csv_to_android_strings_en() {

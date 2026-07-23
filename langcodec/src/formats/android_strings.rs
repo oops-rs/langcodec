@@ -151,7 +151,7 @@ impl From<Resource> for Format {
                         .into_iter()
                         .map(|(cat, v)| PluralItem {
                             quantity: cat,
-                            value: v,
+                            value: encode_android_resource_escapes(&v),
                         })
                         .collect();
                     // Ensure stable order later
@@ -191,7 +191,7 @@ impl From<Format> for Resource {
             let mut forms = std::collections::BTreeMap::new();
             for item in pr.items {
                 let PluralItem { quantity, value } = item;
-                forms.insert(quantity, value);
+                forms.insert(quantity, decode_android_resource_escapes(&value));
             }
             let all_empty = forms.values().all(|v| v.is_empty());
             let status = match pr.translatable {
@@ -242,6 +242,7 @@ impl StringResource {
             comment,
         } = self;
 
+        let value = decode_android_resource_escapes(&value);
         let is_value_empty = value.is_empty();
 
         Entry {
@@ -263,7 +264,7 @@ impl StringResource {
             name: entry.id.clone(),
             value: match &entry.value {
                 Translation::Empty => String::new(),
-                Translation::Singular(v) => v.clone(),
+                Translation::Singular(v) => encode_android_resource_escapes(v),
                 Translation::Plural(_) => String::new(), // Plurals not supported in strings.xml
             },
             comment: entry.comment.clone(),
@@ -275,6 +276,82 @@ impl StringResource {
             },
         }
     }
+}
+
+/// Decodes the Android-only escape marker while preserving langcodec's existing raw escape-token
+/// representation for newlines, tabs, and literal backslashes.
+///
+/// Android removes an odd final backslash before an apostrophe or percent sign. Keeping the paired
+/// backslashes in the run preserves literal backslashes, so `\\\'` becomes `\\'`, not `'`.
+fn decode_android_resource_escapes(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut decoded = String::with_capacity(value.len());
+    let mut index = 0;
+
+    while index < chars.len() {
+        if chars[index] != '\\' {
+            decoded.push(chars[index]);
+            index += 1;
+            continue;
+        }
+
+        let run_start = index;
+        while index < chars.len() && chars[index] == '\\' {
+            index += 1;
+        }
+        let run_length = index - run_start;
+        let removes_escape_marker =
+            run_length % 2 == 1 && index < chars.len() && matches!(chars[index], '\'' | '%');
+        let emitted_backslashes = run_length - usize::from(removes_escape_marker);
+        decoded.extend(std::iter::repeat_n('\\', emitted_backslashes));
+
+        if removes_escape_marker {
+            decoded.push(chars[index]);
+            index += 1;
+        }
+    }
+
+    decoded
+}
+
+/// Encodes apostrophes for Android XML while keeping already escaped odd backslash runs stable.
+/// Percent signs do not need to be escaped when writing Android resources.
+fn encode_android_resource_escapes(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut encoded = String::with_capacity(value.len());
+    let mut index = 0;
+
+    while index < chars.len() {
+        if chars[index] == '\'' {
+            encoded.push('\\');
+            encoded.push('\'');
+            index += 1;
+            continue;
+        }
+
+        if chars[index] != '\\' {
+            encoded.push(chars[index]);
+            index += 1;
+            continue;
+        }
+
+        let run_start = index;
+        while index < chars.len() && chars[index] == '\\' {
+            index += 1;
+        }
+        let run_length = index - run_start;
+        encoded.extend(std::iter::repeat_n('\\', run_length));
+
+        if index < chars.len() && chars[index] == '\'' {
+            if run_length % 2 == 0 {
+                encoded.push('\\');
+            }
+            encoded.push('\'');
+            index += 1;
+        }
+    }
+
+    encoded
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -462,6 +539,7 @@ mod tests {
     use super::*;
     use crate::traits::Parser;
     use crate::types::EntryStatus;
+    use std::collections::BTreeMap;
 
     #[test]
     fn test_parse_basic_strings_xml() {
@@ -657,8 +735,87 @@ World
     }
 
     #[test]
+    fn test_resource_conversion_decodes_android_escape_markers() {
+        let xml = r#"
+        <resources>
+            <string name="invite">Let\'s pay \%S at C:\\Program\nNext</string>
+            <plurals name="turns">
+                <item quantity="one">It\'s \%S turn</item>
+                <item quantity="other">They\'re %d turns</item>
+            </plurals>
+        </resources>
+        "#;
+
+        let resource = Resource::from(Format::from_str(xml).unwrap());
+        assert_eq!(
+            resource.find_entry("invite").unwrap().value,
+            Translation::Singular(r#"Let's pay %S at C:\\Program\nNext"#.to_string())
+        );
+
+        let Translation::Plural(plural) = &resource.find_entry("turns").unwrap().value else {
+            panic!("expected plural translation");
+        };
+        assert_eq!(plural.forms[&PluralCategory::One], "It's %S turn");
+        assert_eq!(plural.forms[&PluralCategory::Other], "They're %d turns");
+    }
+
+    #[test]
+    fn test_android_escape_runs_preserve_literal_backslashes() {
+        let cases = [
+            (r#"Let\'s"#, "Let's", r#"Let\'s"#),
+            (r#"Let\\\'s"#, r#"Let\\'s"#, r#"Let\\\'s"#),
+            (r#"\%S"#, "%S", "%S"),
+            (r#"C:\\Program"#, r#"C:\\Program"#, r#"C:\\Program"#),
+            (r#"Line1\nLine2"#, r#"Line1\nLine2"#, r#"Line1\nLine2"#),
+            ("100%%", "100%%", "100%%"),
+        ];
+
+        for (android, resource, reencoded_android) in cases {
+            assert_eq!(decode_android_resource_escapes(android), resource);
+            assert_eq!(encode_android_resource_escapes(resource), reencoded_android);
+        }
+    }
+
+    #[test]
+    fn test_resource_conversion_encodes_android_apostrophes() {
+        let resource = Resource {
+            metadata: Metadata {
+                language: "en".into(),
+                domain: String::new(),
+                custom: HashMap::new(),
+            },
+            entries: vec![
+                Entry {
+                    id: "singular".into(),
+                    value: Translation::Singular("Let's play".into()),
+                    comment: None,
+                    status: EntryStatus::Translated,
+                    custom: HashMap::new(),
+                },
+                Entry {
+                    id: "plural".into(),
+                    value: Translation::Plural(Plural {
+                        id: "plural".into(),
+                        forms: BTreeMap::from([
+                            (PluralCategory::One, "It's one".into()),
+                            (PluralCategory::Other, "They're many".into()),
+                        ]),
+                    }),
+                    comment: None,
+                    status: EntryStatus::Translated,
+                    custom: HashMap::new(),
+                },
+            ],
+        };
+
+        let format = Format::from(resource);
+        assert_eq!(format.strings[0].value, r#"Let\'s play"#);
+        assert_eq!(format.plurals[0].items[0].value, r#"It\'s one"#);
+        assert_eq!(format.plurals[0].items[1].value, r#"They\'re many"#);
+    }
+
+    #[test]
     fn test_resource_to_android_format_with_plurals() {
-        use std::collections::BTreeMap;
         let mut forms = BTreeMap::new();
         forms.insert(PluralCategory::One, "One file".to_string());
         forms.insert(PluralCategory::Other, "%d files".to_string());

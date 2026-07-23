@@ -158,7 +158,7 @@ fn parse_edge_case_corpora_table_driven() {
                 expected.push(ExpectedValue {
                     language: "en",
                     key: "apostrophe_text",
-                    value: "Don\\'t stop",
+                    value: "Don't stop",
                 });
                 expected
             },
@@ -226,6 +226,21 @@ fn convert_edge_case_corpora_table_driven() {
             output_file_name: "from_android.strings",
             output_lang_hint: Some("en"),
             expected_values: expected_en_stable_values(),
+        },
+        ConvertCase {
+            name: "android -> xcstrings",
+            input_relative_path: "values-en/strings.xml",
+            output_file_name: "from_android.xcstrings",
+            output_lang_hint: None,
+            expected_values: {
+                let mut expected = expected_en_stable_values();
+                expected.push(ExpectedValue {
+                    language: "en",
+                    key: "apostrophe_text",
+                    value: "Don't stop",
+                });
+                expected
+            },
         },
         ConvertCase {
             name: "csv -> xcstrings",

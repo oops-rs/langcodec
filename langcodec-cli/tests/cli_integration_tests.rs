@@ -215,6 +215,63 @@ fn test_merge_command_basic() {
 }
 
 #[test]
+fn test_merge_android_locales_writes_ios_locale_identifiers() {
+    let temp_dir = TempDir::new().unwrap();
+    let output_file = temp_dir.path().join("merged.xcstrings");
+    let fixtures = [
+        ("values", "Hello"),
+        ("values-in", "Halo"),
+        ("values-tl", "Kumusta"),
+        ("values-zh", "你好"),
+        ("values-zh-rTW", "您好"),
+    ];
+
+    for (directory, translation) in fixtures {
+        let values_directory = temp_dir.path().join(directory);
+        fs::create_dir_all(&values_directory).unwrap();
+        let input = values_directory.join("strings.xml");
+        fs::write(
+            &input,
+            format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<resources><string name="greeting">{translation}</string></resources>"#
+            ),
+        )
+        .unwrap();
+    }
+
+    let pattern = format!("{}/values*/strings.xml", temp_dir.path().display());
+    let output = langcodec_cmd()
+        .args([
+            "merge",
+            "-i",
+            &pattern,
+            "-o",
+            output_file.to_str().unwrap(),
+            "--source-language",
+            "en",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "Command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&output_file).unwrap()).unwrap();
+    assert_eq!(document["sourceLanguage"], "en");
+    let localizations = document["strings"]["greeting"]["localizations"]
+        .as_object()
+        .unwrap();
+    let mut languages = localizations.keys().map(String::as_str).collect::<Vec<_>>();
+    languages.sort_unstable();
+    assert_eq!(languages, ["en", "fil", "id", "zh-Hans", "zh-Hant"]);
+}
+
+#[test]
 fn test_merge_command_with_glob_pattern() {
     let temp_dir = TempDir::new().unwrap();
     let dir = temp_dir.path();
