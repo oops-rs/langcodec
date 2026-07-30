@@ -1,14 +1,20 @@
 //! Support for CSV localization format.
 //!
-//! Supports multi-language format where the first column is the key and subsequent columns are translations.
-//! Only singular key-value pairs are supported; plurals will be dropped during conversion.
-//! Provides parsing, serialization, and conversion to/from the internal `Resource` model.
-use std::{collections::HashMap, io::BufRead};
+//! Supports the conventional wide `key,<language>...` schema for simple
+//! singular catalogs and a versioned long schema for lossless resources.
+//! Resource conversion selects the basic schema only when its singular entries
+//! and canonical basic metadata can be reconstructed exactly. Even singular
+//! resources use the extended schema when basic decoding would otherwise
+//! invent or discard model fields.
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    io::{BufRead, Write},
+};
 
 use crate::{
     error::Error,
     traits::Parser,
-    types::{Entry, EntryStatus, Metadata, Resource, Translation},
+    types::{Entry, EntryStatus, Metadata, Plural, PluralCategory, Resource, Translation},
 };
 
 /// Represents a multi-language CSV record where the first column is the key
@@ -39,10 +45,16 @@ impl MultiLanguageCSVRecord {
     }
 }
 
-/// Represents the CSV format containing all records.
+/// Represents the CSV format containing all basic-schema records.
+///
+/// Lossless extended data is held privately so it cannot appear as fabricated
+/// user records. Construct values with [`Format::new`] or
+/// [`Format::with_records`]; the private schema field intentionally prevents
+/// external struct literals from bypassing schema invariants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Format {
     pub records: Vec<MultiLanguageCSVRecord>,
+    schema: TabularSchema,
 }
 
 impl Format {
@@ -50,12 +62,20 @@ impl Format {
     pub fn new() -> Self {
         Self {
             records: Vec::new(),
+            schema: TabularSchema::Basic {
+                language_order: Vec::new(),
+            },
         }
     }
 
     /// Creates a new CSV format with the given records.
     pub fn with_records(records: Vec<MultiLanguageCSVRecord>) -> Self {
-        Self { records }
+        Self {
+            records,
+            schema: TabularSchema::Basic {
+                language_order: Vec::new(),
+            },
+        }
     }
 
     /// Adds a record to the format.
@@ -72,6 +92,15 @@ impl Format {
     pub fn get_records_mut(&mut self) -> &mut [MultiLanguageCSVRecord] {
         &mut self.records
     }
+
+    /// Returns whether this value uses langcodec's lossless extended schema.
+    ///
+    /// This is useful to callers which add legacy provenance metadata after
+    /// parsing: extended files already carry exact resource metadata and must
+    /// not be decorated or overwritten.
+    pub fn is_extended(&self) -> bool {
+        matches!(&self.schema, TabularSchema::Extended { .. })
+    }
 }
 
 impl Default for Format {
@@ -80,125 +109,880 @@ impl Default for Format {
     }
 }
 
-impl Parser for Format {
-    /// Parse from any reader, automatically detecting single vs multi-language format.
-    fn from_reader<R: BufRead>(reader: R) -> Result<Self, Error> {
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(false)
-            .from_reader(reader);
+pub(crate) const EXTENDED_HEADER: [&str; 16] = [
+    "__langcodec_extended_v1",
+    "row_kind",
+    "resource_index",
+    "entry_index",
+    "language",
+    "domain",
+    "resource_custom",
+    "key",
+    "value_kind",
+    "plural_id",
+    "plural_category",
+    "value",
+    "status",
+    "comment_kind",
+    "comment",
+    "entry_custom",
+];
 
-        let mut records = Vec::new();
-        let mut lines = rdr.records();
+const EXTENDED_RESERVED_PREFIX: &str = "__langcodec_extended_";
+const EXTENDED_ROW_VERSION: &str = "v1";
 
-        // Read the first line to determine the format
-        if let Some(first_line) = lines.next() {
-            let first_line = first_line.map_err(Error::CsvParse)?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TabularSchema {
+    Basic { language_order: Vec<String> },
+    Extended { resources: Vec<Resource> },
+}
 
-            if first_line.len() == 2 {
-                if first_line[0].trim().eq_ignore_ascii_case("key") {
-                    // Single-language header form: key, <lang>
-                    let language = first_line[1].trim().to_string();
-                    if language.is_empty() {
-                        return Err(Error::DataMismatch(
-                            "Invalid CSV format: missing language in header".to_string(),
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BasicRecord {
+    pub key: String,
+    pub translations: HashMap<String, String>,
+}
+
+fn data_mismatch(format_name: &str, row: usize, message: impl AsRef<str>) -> Error {
+    Error::DataMismatch(format!(
+        "Invalid {format_name} row {row}: {}",
+        message.as_ref()
+    ))
+}
+
+fn exact_header(row: &[String]) -> bool {
+    row.len() == EXTENDED_HEADER.len()
+        && row
+            .iter()
+            .zip(EXTENDED_HEADER)
+            .all(|(actual, expected)| actual == expected)
+}
+
+pub(crate) fn parse_tabular<R: BufRead>(
+    reader: R,
+    delimiter: u8,
+    format_name: &str,
+) -> Result<(Vec<BasicRecord>, TabularSchema), Error> {
+    let mut csv_reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .delimiter(delimiter)
+        .from_reader(reader);
+    let rows = csv_reader
+        .records()
+        .map(|record| {
+            record
+                .map(|record| record.iter().map(ToOwned::to_owned).collect::<Vec<_>>())
+                .map_err(Error::CsvParse)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let Some(first) = rows.first() else {
+        return Ok((
+            Vec::new(),
+            TabularSchema::Basic {
+                language_order: Vec::new(),
+            },
+        ));
+    };
+
+    if exact_header(first) {
+        let resources = parse_extended_rows(&rows[1..], format_name)?;
+        return Ok((Vec::new(), TabularSchema::Extended { resources }));
+    }
+
+    if first
+        .first()
+        .is_some_and(|field| field.starts_with(EXTENDED_RESERVED_PREFIX))
+    {
+        return Err(data_mismatch(
+            format_name,
+            1,
+            "unknown or malformed extended schema header",
+        ));
+    }
+
+    parse_basic_rows(&rows, format_name)
+}
+
+fn parse_basic_rows(
+    rows: &[Vec<String>],
+    format_name: &str,
+) -> Result<(Vec<BasicRecord>, TabularSchema), Error> {
+    let first = &rows[0];
+    if first.len() < 2 {
+        return Err(data_mismatch(
+            format_name,
+            1,
+            "expected at least two columns",
+        ));
+    }
+
+    let (language_order, data_start, width) =
+        if first.len() == 2 && !first[0].trim().eq_ignore_ascii_case("key") {
+            (vec!["default".to_string()], 0, 2)
+        } else {
+            if !first[0].trim().eq_ignore_ascii_case("key") {
+                return Err(data_mismatch(
+                    format_name,
+                    1,
+                    "wide schema header must begin with `key`",
+                ));
+            }
+            let languages = first.iter().skip(1).cloned().collect::<Vec<_>>();
+            validate_languages(&languages, format_name, 1)?;
+            (languages, 1, first.len())
+        };
+
+    let mut seen_keys = HashSet::new();
+    let mut records = Vec::with_capacity(rows.len().saturating_sub(data_start));
+    for (index, row) in rows.iter().enumerate().skip(data_start) {
+        let row_number = index + 1;
+        if row.len() != width {
+            return Err(data_mismatch(
+                format_name,
+                row_number,
+                format!("expected {width} columns, found {}", row.len()),
+            ));
+        }
+        if !seen_keys.insert(row[0].clone()) {
+            return Err(data_mismatch(
+                format_name,
+                row_number,
+                format!("duplicate key `{}`", row[0]),
+            ));
+        }
+        let translations = language_order
+            .iter()
+            .cloned()
+            .zip(row.iter().skip(1).cloned())
+            .collect();
+        records.push(BasicRecord {
+            key: row[0].clone(),
+            translations,
+        });
+    }
+
+    Ok((records, TabularSchema::Basic { language_order }))
+}
+
+fn validate_languages(languages: &[String], format_name: &str, row: usize) -> Result<(), Error> {
+    let mut seen = HashSet::new();
+    for language in languages {
+        if language.is_empty() {
+            return Err(data_mismatch(
+                format_name,
+                row,
+                "language headers cannot be empty",
+            ));
+        }
+        if language.trim() != language.as_str() {
+            return Err(data_mismatch(
+                format_name,
+                row,
+                format!("language header `{language}` has leading or trailing whitespace"),
+            ));
+        }
+        if !seen.insert(language) {
+            return Err(data_mismatch(
+                format_name,
+                row,
+                format!("duplicate language header `{language}`"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_tabular<W: Write>(
+    writer: W,
+    delimiter: u8,
+    format_name: &str,
+    records: &[BasicRecord],
+    schema: &TabularSchema,
+) -> Result<(), Error> {
+    let mut csv_writer = csv::WriterBuilder::new()
+        .delimiter(delimiter)
+        .from_writer(writer);
+
+    match schema {
+        TabularSchema::Extended { resources } => {
+            if !records.is_empty() {
+                return Err(Error::DataMismatch(format!(
+                    "Invalid {format_name}: extended schema cannot contain basic records"
+                )));
+            }
+            csv_writer
+                .write_record(EXTENDED_HEADER)
+                .map_err(Error::CsvParse)?;
+            for row in extended_rows(resources)? {
+                csv_writer.write_record(row).map_err(Error::CsvParse)?;
+            }
+        }
+        TabularSchema::Basic { language_order } => {
+            if records.is_empty() && language_order.is_empty() {
+                return Ok(());
+            }
+            let languages = ordered_languages(records, language_order);
+            validate_languages(&languages, format_name, 1)?;
+            if languages.is_empty() {
+                return Err(Error::DataMismatch(format!(
+                    "Invalid {format_name}: basic records require at least one language"
+                )));
+            }
+
+            let mut seen_keys = HashSet::new();
+            for (index, record) in records.iter().enumerate() {
+                if !seen_keys.insert(&record.key) {
+                    return Err(data_mismatch(
+                        format_name,
+                        index + 2,
+                        format!("duplicate key `{}`", record.key),
+                    ));
+                }
+            }
+
+            let mut header = vec!["key".to_string()];
+            header.extend(languages.iter().cloned());
+            csv_writer.write_record(header).map_err(Error::CsvParse)?;
+            for record in records {
+                let mut row = vec![record.key.clone()];
+                row.extend(languages.iter().map(|language| {
+                    record
+                        .translations
+                        .get(language)
+                        .cloned()
+                        .unwrap_or_default()
+                }));
+                csv_writer.write_record(row).map_err(Error::CsvParse)?;
+            }
+        }
+    }
+
+    csv_writer.flush().map_err(Error::Io)
+}
+
+pub(crate) fn tabular_from_resources(
+    resources: Vec<Resource>,
+) -> Result<(Vec<BasicRecord>, TabularSchema), Error> {
+    if resources.is_empty() {
+        return Ok((
+            Vec::new(),
+            TabularSchema::Basic {
+                language_order: Vec::new(),
+            },
+        ));
+    }
+    validate_plural_payloads(&resources, "tabular output")?;
+
+    if basic_is_compatible(&resources) {
+        let language_order = resources
+            .iter()
+            .map(|resource| resource.metadata.language.clone())
+            .collect::<Vec<_>>();
+        let records = resources[0]
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(entry_index, entry)| {
+                let translations = resources
+                    .iter()
+                    .map(|resource| {
+                        let Translation::Singular(value) = &resource.entries[entry_index].value
+                        else {
+                            unreachable!("basic_is_compatible rejects non-singular values")
+                        };
+                        (resource.metadata.language.clone(), value.clone())
+                    })
+                    .collect();
+                BasicRecord {
+                    key: entry.id.clone(),
+                    translations,
+                }
+            })
+            .collect();
+        Ok((records, TabularSchema::Basic { language_order }))
+    } else {
+        Ok((Vec::new(), TabularSchema::Extended { resources }))
+    }
+}
+
+fn basic_is_compatible(resources: &[Resource]) -> bool {
+    let Some(first) = resources.first() else {
+        return true;
+    };
+
+    let source_language = &first.metadata.language;
+    let expected_custom = HashMap::from([
+        ("source_language".to_string(), source_language.clone()),
+        ("version".to_string(), "1.0".to_string()),
+    ]);
+    let expected_keys = first
+        .entries
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect::<Vec<_>>();
+    let unique_keys = expected_keys.iter().copied().collect::<HashSet<_>>();
+    if unique_keys.len() != expected_keys.len() {
+        return false;
+    }
+
+    let mut languages = HashSet::new();
+    resources.iter().all(|resource| {
+        !resource.metadata.language.is_empty()
+            && resource.metadata.language.trim() == resource.metadata.language.as_str()
+            && languages.insert(resource.metadata.language.clone())
+            && metadata_is_basic_compatible(resource, &expected_custom)
+            && resource.entries.len() == expected_keys.len()
+            && resource
+                .entries
+                .iter()
+                .zip(&expected_keys)
+                .all(|(entry, expected_key)| {
+                    entry.id.as_str() == *expected_key
+                        && matches!(&entry.value, Translation::Singular(_))
+                        && entry.comment.is_none()
+                        && entry.status == EntryStatus::Translated
+                        && entry.custom.is_empty()
+                })
+    })
+}
+
+fn metadata_is_basic_compatible(
+    resource: &Resource,
+    expected_custom: &HashMap<String, String>,
+) -> bool {
+    resource.metadata.domain.is_empty() && &resource.metadata.custom == expected_custom
+}
+
+pub(crate) fn tabular_into_resources(
+    records: Vec<BasicRecord>,
+    schema: TabularSchema,
+) -> Result<Vec<Resource>, Error> {
+    match schema {
+        TabularSchema::Extended { resources } => {
+            if records.is_empty() {
+                Ok(resources)
+            } else {
+                Err(Error::DataMismatch(
+                    "Extended tabular schema cannot contain basic records".to_string(),
+                ))
+            }
+        }
+        TabularSchema::Basic { language_order } => {
+            if records.is_empty() && language_order.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let mut seen_keys = HashSet::new();
+            for (index, record) in records.iter().enumerate() {
+                if !seen_keys.insert(&record.key) {
+                    return Err(data_mismatch(
+                        "tabular",
+                        index + 1,
+                        format!("duplicate key `{}`", record.key),
+                    ));
+                }
+            }
+
+            let languages = ordered_languages(&records, &language_order);
+            validate_languages(&languages, "tabular", 1)?;
+            if languages.is_empty() {
+                return Err(Error::DataMismatch(
+                    "Basic tabular records require at least one language".to_string(),
+                ));
+            }
+
+            let source_language = languages
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "en".to_string());
+            let custom = HashMap::from([
+                ("source_language".to_string(), source_language),
+                ("version".to_string(), "1.0".to_string()),
+            ]);
+            let resources = languages
+                .into_iter()
+                .map(|language| {
+                    let entries = records
+                        .iter()
+                        .map(|record| Entry {
+                            id: record.key.clone(),
+                            value: Translation::Singular(
+                                record
+                                    .translations
+                                    .get(&language)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            ),
+                            comment: None,
+                            status: EntryStatus::Translated,
+                            custom: HashMap::new(),
+                        })
+                        .collect();
+                    Resource {
+                        metadata: Metadata {
+                            language,
+                            domain: String::new(),
+                            custom: custom.clone(),
+                        },
+                        entries,
+                    }
+                })
+                .collect();
+            Ok(resources)
+        }
+    }
+}
+
+fn ordered_languages(records: &[BasicRecord], declared_languages: &[String]) -> Vec<String> {
+    if records.is_empty() {
+        return declared_languages.to_vec();
+    }
+
+    let declared = declared_languages.iter().cloned().collect::<HashSet<_>>();
+    let mut languages = declared_languages
+        .iter()
+        .filter(|language| {
+            records
+                .iter()
+                .any(|record| record.translations.contains_key(*language))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut added_languages = records
+        .iter()
+        .flat_map(|record| record.translations.keys().cloned())
+        .filter(|language| !declared.contains(language))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    added_languages.sort();
+    languages.extend(added_languages);
+    languages
+}
+
+fn extended_rows(resources: &[Resource]) -> Result<Vec<Vec<String>>, Error> {
+    let mut rows = Vec::new();
+    for (resource_index, resource) in resources.iter().enumerate() {
+        rows.push(vec![
+            EXTENDED_ROW_VERSION.to_string(),
+            "resource".to_string(),
+            resource_index.to_string(),
+            String::new(),
+            resource.metadata.language.clone(),
+            resource.metadata.domain.clone(),
+            encode_custom(&resource.metadata.custom)?,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ]);
+        for (entry_index, entry) in resource.entries.iter().enumerate() {
+            let (value_kind, plural_id, value) = match &entry.value {
+                Translation::Empty => ("empty", String::new(), String::new()),
+                Translation::Singular(value) => ("singular", String::new(), value.clone()),
+                Translation::Plural(plural) => ("plural", plural.id.clone(), String::new()),
+            };
+            rows.push(vec![
+                EXTENDED_ROW_VERSION.to_string(),
+                "entry".to_string(),
+                resource_index.to_string(),
+                entry_index.to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                entry.id.clone(),
+                value_kind.to_string(),
+                plural_id,
+                String::new(),
+                value,
+                status_name(&entry.status).to_string(),
+                if entry.comment.is_some() {
+                    "some".to_string()
+                } else {
+                    "none".to_string()
+                },
+                entry.comment.clone().unwrap_or_default(),
+                encode_custom(&entry.custom)?,
+            ]);
+            if let Translation::Plural(plural) = &entry.value {
+                for (category, value) in &plural.forms {
+                    rows.push(vec![
+                        EXTENDED_ROW_VERSION.to_string(),
+                        "plural_form".to_string(),
+                        resource_index.to_string(),
+                        entry_index.to_string(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        plural_category_name(category).to_string(),
+                        value.clone(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    ]);
+                }
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn parse_extended_rows(rows: &[Vec<String>], format_name: &str) -> Result<Vec<Resource>, Error> {
+    let mut resources: Vec<Resource> = Vec::new();
+    for (offset, row) in rows.iter().enumerate() {
+        let row_number = offset + 2;
+        if row.len() != EXTENDED_HEADER.len() {
+            return Err(data_mismatch(
+                format_name,
+                row_number,
+                format!(
+                    "expected {} columns, found {}",
+                    EXTENDED_HEADER.len(),
+                    row.len()
+                ),
+            ));
+        }
+        if row[0] != EXTENDED_ROW_VERSION {
+            return Err(data_mismatch(
+                format_name,
+                row_number,
+                format!("expected row schema `{EXTENDED_ROW_VERSION}`"),
+            ));
+        }
+        match row[1].as_str() {
+            "resource" => {
+                require_blank(
+                    row,
+                    &[3, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                    format_name,
+                    row_number,
+                )?;
+                let resource_index =
+                    parse_index(&row[2], "resource_index", format_name, row_number)?;
+                if resource_index != resources.len() {
+                    return Err(data_mismatch(
+                        format_name,
+                        row_number,
+                        format!(
+                            "resource_index must be {}, found {resource_index}",
+                            resources.len()
+                        ),
+                    ));
+                }
+                resources.push(Resource {
+                    metadata: Metadata {
+                        language: row[4].clone(),
+                        domain: row[5].clone(),
+                        custom: decode_custom(&row[6], "resource_custom", format_name, row_number)?,
+                    },
+                    entries: Vec::new(),
+                });
+            }
+            "entry" => {
+                require_blank(row, &[4, 5, 6, 10], format_name, row_number)?;
+                let resource_index =
+                    parse_index(&row[2], "resource_index", format_name, row_number)?;
+                let current_resource_index = resources.len().checked_sub(1).ok_or_else(|| {
+                    data_mismatch(
+                        format_name,
+                        row_number,
+                        "entry row appears before a resource row",
+                    )
+                })?;
+                let Some(resource) = resources.last_mut() else {
+                    return Err(data_mismatch(
+                        format_name,
+                        row_number,
+                        "entry row appears before a resource row",
+                    ));
+                };
+                if resource_index != current_resource_index {
+                    return Err(data_mismatch(
+                        format_name,
+                        row_number,
+                        "entry row must belong to the current resource",
+                    ));
+                }
+                let entry_index = parse_index(&row[3], "entry_index", format_name, row_number)?;
+                if entry_index != resource.entries.len() {
+                    return Err(data_mismatch(
+                        format_name,
+                        row_number,
+                        format!(
+                            "entry_index must be {}, found {entry_index}",
+                            resource.entries.len()
+                        ),
+                    ));
+                }
+                let value = match row[8].as_str() {
+                    "empty" => {
+                        require_blank(row, &[9, 11], format_name, row_number)?;
+                        Translation::Empty
+                    }
+                    "singular" => {
+                        require_blank(row, &[9], format_name, row_number)?;
+                        Translation::Singular(row[11].clone())
+                    }
+                    "plural" => {
+                        require_blank(row, &[11], format_name, row_number)?;
+                        Translation::Plural(Plural {
+                            id: row[9].clone(),
+                            forms: BTreeMap::new(),
+                        })
+                    }
+                    other => {
+                        return Err(data_mismatch(
+                            format_name,
+                            row_number,
+                            format!("unknown value_kind `{other}`"),
                         ));
                     }
-                    for line in lines {
-                        let line = line.map_err(Error::CsvParse)?;
-                        if line.len() == 2 {
-                            let mut record = MultiLanguageCSVRecord::new(line[0].to_string());
-                            record.add_translation(language.clone(), line[1].to_string());
-                            records.push(record);
-                        }
+                };
+                let status = row[12]
+                    .parse::<EntryStatus>()
+                    .map_err(|message| data_mismatch(format_name, row_number, message))?;
+                let comment = match row[13].as_str() {
+                    "none" => {
+                        require_blank(row, &[14], format_name, row_number)?;
+                        None
                     }
-                } else {
-                    // Single language data form: key, value
-                    // First line is data, not header
-                    records.push(MultiLanguageCSVRecord {
-                        key: first_line[0].to_string(),
-                        translations: {
-                            let mut map = HashMap::new();
-                            map.insert("default".to_string(), first_line[1].to_string());
-                            map
-                        },
-                    });
-
-                    // Process remaining lines
-                    for line in lines {
-                        let line = line.map_err(Error::CsvParse)?;
-                        if line.len() == 2 {
-                            let mut record = MultiLanguageCSVRecord::new(line[0].to_string());
-                            record.add_translation("default".to_string(), line[1].to_string());
-                            records.push(record);
-                        }
+                    "some" => Some(row[14].clone()),
+                    other => {
+                        return Err(data_mismatch(
+                            format_name,
+                            row_number,
+                            format!("unknown comment_kind `{other}`"),
+                        ));
                     }
+                };
+                resource.entries.push(Entry {
+                    id: row[7].clone(),
+                    value,
+                    comment,
+                    status,
+                    custom: decode_custom(&row[15], "entry_custom", format_name, row_number)?,
+                });
+            }
+            "plural_form" => {
+                require_blank(
+                    row,
+                    &[4, 5, 6, 7, 8, 9, 12, 13, 14, 15],
+                    format_name,
+                    row_number,
+                )?;
+                let resource_index =
+                    parse_index(&row[2], "resource_index", format_name, row_number)?;
+                let current_resource_index = resources.len().checked_sub(1).ok_or_else(|| {
+                    data_mismatch(
+                        format_name,
+                        row_number,
+                        "plural_form row appears before a resource row",
+                    )
+                })?;
+                let Some(resource) = resources.last_mut() else {
+                    return Err(data_mismatch(
+                        format_name,
+                        row_number,
+                        "plural_form row appears before a resource row",
+                    ));
+                };
+                if resource_index != current_resource_index {
+                    return Err(data_mismatch(
+                        format_name,
+                        row_number,
+                        "plural_form row must belong to the current resource",
+                    ));
                 }
-            } else if first_line.len() >= 3 {
-                // Multi-language format: key, lang1, lang2, ...
-                let languages: Vec<String> =
-                    first_line.iter().skip(1).map(|s| s.to_string()).collect();
-
-                // First line is header, process remaining lines as data
-                for line in lines {
-                    let line = line.map_err(Error::CsvParse)?;
-                    if line.len() >= 2 {
-                        let mut record = MultiLanguageCSVRecord::new(line[0].to_string());
-                        for (i, lang) in languages.iter().enumerate() {
-                            if i + 1 < line.len() {
-                                record.add_translation(lang.clone(), line[i + 1].to_string());
-                            }
-                        }
-                        records.push(record);
-                    }
+                let entry_index = parse_index(&row[3], "entry_index", format_name, row_number)?;
+                let current_entry_index =
+                    resource.entries.len().checked_sub(1).ok_or_else(|| {
+                        data_mismatch(
+                            format_name,
+                            row_number,
+                            "plural_form row appears before an entry row",
+                        )
+                    })?;
+                let Some(entry) = resource.entries.last_mut() else {
+                    return Err(data_mismatch(
+                        format_name,
+                        row_number,
+                        "plural_form row appears before an entry row",
+                    ));
+                };
+                if entry_index != current_entry_index {
+                    return Err(data_mismatch(
+                        format_name,
+                        row_number,
+                        "plural_form row must belong to the current entry",
+                    ));
                 }
-            } else {
-                return Err(Error::DataMismatch(
-                    "Invalid CSV format: insufficient columns".to_string(),
+                let Translation::Plural(plural) = &mut entry.value else {
+                    return Err(data_mismatch(
+                        format_name,
+                        row_number,
+                        "plural_form row belongs to a non-plural entry",
+                    ));
+                };
+                let category = row[10]
+                    .parse::<PluralCategory>()
+                    .map_err(|message| data_mismatch(format_name, row_number, message))?;
+                if plural.forms.insert(category, row[11].clone()).is_some() {
+                    return Err(data_mismatch(
+                        format_name,
+                        row_number,
+                        format!("duplicate plural category `{}`", row[10]),
+                    ));
+                }
+            }
+            other => {
+                return Err(data_mismatch(
+                    format_name,
+                    row_number,
+                    format!("unknown row_kind `{other}`"),
                 ));
             }
         }
+    }
+    validate_plural_payloads(&resources, format_name)?;
+    Ok(resources)
+}
 
-        Ok(Format { records })
+fn validate_plural_payloads(resources: &[Resource], context: &str) -> Result<(), Error> {
+    for resource in resources {
+        for entry in &resource.entries {
+            if let Translation::Plural(plural) = &entry.value
+                && plural.forms.is_empty()
+            {
+                return Err(Error::DataMismatch(format!(
+                    "Invalid {context}: plural entry `{}` in language `{}` has no forms",
+                    entry.id, resource.metadata.language
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_index(value: &str, field: &str, format_name: &str, row: usize) -> Result<usize, Error> {
+    value.parse::<usize>().map_err(|_| {
+        data_mismatch(
+            format_name,
+            row,
+            format!("{field} must be a non-negative integer"),
+        )
+    })
+}
+
+fn require_blank(
+    row: &[String],
+    columns: &[usize],
+    format_name: &str,
+    row_number: usize,
+) -> Result<(), Error> {
+    for &column in columns {
+        if !row[column].is_empty() {
+            return Err(data_mismatch(
+                format_name,
+                row_number,
+                format!(
+                    "column `{}` must be blank for `{}` rows",
+                    EXTENDED_HEADER[column], row[1]
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn encode_custom(custom: &HashMap<String, String>) -> Result<String, Error> {
+    let mut pairs = custom.iter().collect::<Vec<_>>();
+    pairs.sort_by_key(|(key, _)| *key);
+    serde_json::to_string(&pairs).map_err(Error::Parse)
+}
+
+fn decode_custom(
+    encoded: &str,
+    field: &str,
+    format_name: &str,
+    row: usize,
+) -> Result<HashMap<String, String>, Error> {
+    let pairs = serde_json::from_str::<Vec<(String, String)>>(encoded).map_err(|error| {
+        data_mismatch(
+            format_name,
+            row,
+            format!("{field} must be a JSON array of string pairs: {error}"),
+        )
+    })?;
+    let mut custom = HashMap::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        if custom.insert(key.clone(), value).is_some() {
+            return Err(data_mismatch(
+                format_name,
+                row,
+                format!("{field} contains duplicate key `{key}`"),
+            ));
+        }
+    }
+    Ok(custom)
+}
+
+fn status_name(status: &EntryStatus) -> &'static str {
+    match status {
+        EntryStatus::DoNotTranslate => "do_not_translate",
+        EntryStatus::New => "new",
+        EntryStatus::Stale => "stale",
+        EntryStatus::NeedsReview => "needs_review",
+        EntryStatus::Translated => "translated",
+    }
+}
+
+fn plural_category_name(category: &PluralCategory) -> &'static str {
+    match category {
+        PluralCategory::Zero => "zero",
+        PluralCategory::One => "one",
+        PluralCategory::Two => "two",
+        PluralCategory::Few => "few",
+        PluralCategory::Many => "many",
+        PluralCategory::Other => "other",
+    }
+}
+
+impl Parser for Format {
+    fn from_reader<R: BufRead>(reader: R) -> Result<Self, Error> {
+        let (records, schema) = parse_tabular(reader, b',', "CSV")?;
+        Ok(Self {
+            records: records
+                .into_iter()
+                .map(|record| MultiLanguageCSVRecord {
+                    key: record.key,
+                    translations: record.translations,
+                })
+                .collect(),
+            schema,
+        })
     }
 
-    /// Write to any writer (file, memory, etc.).
-    fn to_writer<W: std::io::Write>(&self, writer: W) -> Result<(), Error> {
-        if self.records.is_empty() {
-            return Ok(());
-        }
-
-        let mut wtr = csv::WriterBuilder::new().from_writer(writer);
-
-        // Get all unique languages from all records
-        let mut all_languages = std::collections::HashSet::new();
-        for record in &self.records {
-            for lang in record.translations.keys() {
-                all_languages.insert(lang.clone());
-            }
-        }
-
-        // Sort languages for consistent output
-        let mut sorted_languages: Vec<String> = all_languages.into_iter().collect();
-        sorted_languages.sort();
-
-        // Write header row
-        let mut header = vec!["key".to_string()];
-        header.extend(sorted_languages.clone());
-        wtr.write_record(&header).map_err(Error::CsvParse)?;
-
-        // Write data rows
-        for record in &self.records {
-            let mut row = vec![record.key.clone()];
-            let empty_string = String::new();
-            for lang in &sorted_languages {
-                let value = record.translations.get(lang).unwrap_or(&empty_string);
-                row.push(value.clone());
-            }
-            wtr.write_record(&row).map_err(Error::CsvParse)?;
-        }
-
-        wtr.flush().map_err(Error::Io)?;
-        Ok(())
+    fn to_writer<W: Write>(&self, writer: W) -> Result<(), Error> {
+        let records = self
+            .records
+            .iter()
+            .map(|record| BasicRecord {
+                key: record.key.clone(),
+                translations: record.translations.clone(),
+            })
+            .collect::<Vec<_>>();
+        write_tabular(writer, b',', "CSV", &records, &self.schema)
     }
 }
 
@@ -206,38 +990,17 @@ impl TryFrom<Vec<Resource>> for Format {
     type Error = Error;
 
     fn try_from(resources: Vec<Resource>) -> Result<Self, Self::Error> {
-        if resources.is_empty() {
-            return Ok(Format::new());
-        }
-
-        // Get all unique keys across all resources
-        let mut all_keys = std::collections::HashSet::new();
-        for resource in &resources {
-            for entry in &resource.entries {
-                all_keys.insert(entry.id.clone());
-            }
-        }
-
-        // Create a multi-language record for each key
-        let mut records = Vec::new();
-        for key in all_keys {
-            let mut record = MultiLanguageCSVRecord::new(key);
-
-            for resource in &resources {
-                if let Some(entry) = resource.entries.iter().find(|e| e.id == record.key) {
-                    let value = match &entry.value {
-                        Translation::Empty => String::new(),
-                        Translation::Singular(v) => v.clone(),
-                        Translation::Plural(_) => String::new(), // Plurals not supported
-                    };
-                    record.add_translation(resource.metadata.language.clone(), value);
-                }
-            }
-
-            records.push(record);
-        }
-
-        Ok(Format { records })
+        let (records, schema) = tabular_from_resources(resources)?;
+        Ok(Self {
+            records: records
+                .into_iter()
+                .map(|record| MultiLanguageCSVRecord {
+                    key: record.key,
+                    translations: record.translations,
+                })
+                .collect(),
+            schema,
+        })
     }
 }
 
@@ -245,60 +1008,15 @@ impl TryFrom<Format> for Vec<Resource> {
     type Error = Error;
 
     fn try_from(format: Format) -> Result<Self, Self::Error> {
-        if format.records.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Get all unique languages
-        let mut all_languages = std::collections::HashSet::new();
-        for record in &format.records {
-            for lang in record.translations.keys() {
-                all_languages.insert(lang.clone());
-            }
-        }
-
-        // Create a resource for each language
-        let mut resources = Vec::new();
-        let mut custom_metadata = HashMap::new();
-
-        // Add required metadata for XCStrings compatibility
-        // Use the first language as source language, or "en" as default
-        let source_language = all_languages
-            .iter()
-            .next()
-            .unwrap_or(&"en".to_string())
-            .clone();
-        custom_metadata.insert("source_language".to_string(), source_language);
-        custom_metadata.insert("version".to_string(), "1.0".to_string());
-
-        for language in all_languages {
-            let mut resource = Resource {
-                metadata: Metadata {
-                    language: language.clone(),
-                    domain: String::from(""),
-                    custom: custom_metadata.clone(),
-                },
-                entries: Vec::new(),
-            };
-
-            for record in &format.records {
-                if let Some(translation) = record.translations.get(&language) {
-                    resource.entries.push(Entry {
-                        id: record.key.clone(),
-                        value: Translation::Singular(translation.clone()),
-                        comment: None,
-                        status: EntryStatus::Translated,
-                        custom: HashMap::new(),
-                    });
-                }
-            }
-
-            if !resource.entries.is_empty() {
-                resources.push(resource);
-            }
-        }
-
-        Ok(resources)
+        let records = format
+            .records
+            .into_iter()
+            .map(|record| BasicRecord {
+                key: record.key,
+                translations: record.translations,
+            })
+            .collect();
+        tabular_into_resources(records, format.schema)
     }
 }
 

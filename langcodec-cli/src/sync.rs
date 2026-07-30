@@ -45,6 +45,13 @@ fn reject_xliff_sync_paths(
     target: &str,
     output: Option<&String>,
 ) -> Result<(), String> {
+    if target.ends_with(".stringsdict") || output.is_some_and(|path| path.ends_with(".stringsdict"))
+    {
+        return Err(
+            ".stringsdict cannot be a `sync` target or output because sync provenance is not representable. It may still be used as the source."
+                .to_string(),
+        );
+    }
     if source.ends_with(".xliff")
         || target.ends_with(".xliff")
         || output.is_some_and(|path| path.ends_with(".xliff"))
@@ -90,6 +97,10 @@ fn write_back(
             langcodec::Codec::write_resource_to_file(res, out)
                 .map_err(|e| format!("Error writing output: {}", e))
         }
+        FormatType::Stringsdict(_) => Err(
+            ".stringsdict cannot be a `sync` target or output because sync provenance is not representable."
+                .to_string(),
+        ),
         FormatType::Xcstrings | FormatType::CSV | FormatType::TSV => {
             langcodec::converter::convert_resources_to_format(codec.resources.clone(), out, fmt)
                 .map_err(|e| format!("Error writing output: {}", e))
@@ -148,7 +159,7 @@ pub fn run_sync_command(opts: SyncOptions) -> Result<(), String> {
         validate_output_path(report_path)?;
     }
 
-    let source_resources = read_resources_from_any_input(&opts.source, None, opts.strict)?;
+    let source_resources = read_resources_from_any_input(&opts.source, None, None, opts.strict)?;
     let mut target_codec = Codec::new();
     target_codec
         .read_file_by_extension_with_options(

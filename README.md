@@ -37,7 +37,7 @@
 
 Most localization workflows are a pile of one-off scripts, format-specific tools, spreadsheet exports, and CI glue. `langcodec` gives you one Rust-native toolkit for the loop teams actually run:
 
-- move between Apple, Android, and tabular formats without losing structure
+- move between Apple, Android, and tabular formats with explicit errors when a target format cannot preserve the resource model
 - inspect stale, missing, or incomplete strings before they ship
 - normalize files so diffs stay readable in review and CI
 - draft translations with AI-backed providers
@@ -47,8 +47,8 @@ Most localization workflows are a pile of one-off scripts, format-specific tools
 ## Highlights
 
 - Unified data model for singular and plural translations
-- Read and write support for Apple `.strings`, Apple `.xcstrings`, Apple/Xcode `.xliff`, Android `strings.xml`, CSV, and TSV
-- CLI commands for convert, diff, merge, sync, edit, normalize, view, stats, debug, translate, annotate, and Tolgee sync
+- Read and write support for Apple `.strings`, `.stringsdict` (XML and binary read; canonical XML write), Apple `.xcstrings`, Apple/Xcode `.xliff`, Android `strings.xml`, CSV, and TSV
+- CLI commands for convert, check, diff, merge, sync, edit, normalize, view, stats, debug, translate, annotate, and Tolgee sync
 - Config-driven AI workflows with `langcodec.toml`
 - Rust library API for teams building custom localization pipelines
 
@@ -89,6 +89,9 @@ langcodec view -i Localizable.xcstrings --status new,needs_review --keys-only
 
 # Normalize catalogs in CI
 langcodec normalize -i 'locales/**/*.{strings,xml,csv,tsv,xcstrings}' --check
+
+# Validate catalogs without modifying them
+langcodec check -i 'locales/**/*.{strings,stringsdict,xml,xcstrings,xliff,csv,tsv}'
 
 # Draft translations into an existing string catalog
 langcodec translate \
@@ -135,15 +138,54 @@ langcodec annotate \
 | Format                | Parse | Write | Convert | Merge | Plurals | Comments |
 | --------------------- | :---: | :---: | :-----: | :---: | :-----: | :------: |
 | Apple `.strings`      |  yes  |  yes  |   yes   |  yes  |   no    |   yes    |
+| Apple `.stringsdict`* |  yes  |  yes  |   yes   |  yes  |   yes   |    no    |
 | Apple `.xcstrings`    |  yes  |  yes  |   yes   |  yes  |   yes   |   yes    |
 | Apple `.xliff`        |  yes  |  yes  |   yes   |   no  |   no    |   yes    |
 | Android `strings.xml` |  yes  |  yes  |   yes   |  yes  |   yes   |   yes    |
-| CSV                   |  yes  |  yes  |   yes   |  yes  |   no    |    no    |
-| TSV                   |  yes  |  yes  |   yes   |  yes  |   no    |    no    |
+| CSV†                  |  yes  |  yes  |   yes   |  yes  |   yes   |   yes    |
+| TSV†                  |  yes  |  yes  |   yes   |  yes  |   yes   |   yes    |
+
+`*.stringsdict` support is deliberately limited to one bare
+`NSStringPluralRuleType` variable per key. XML and binary plists are accepted
+as input; output is always canonical XML. Wrapper text, nested/select/gender
+rules, multiple variables, entry comments, statuses that cannot be derived from
+the forms, and non-structural custom metadata are rejected rather than
+flattened or silently dropped.
+
+Writing a generic `Resource` as `.stringsdict` requires explicit selector
+identity in all three entry custom keys: `stringsdict.localized_format`,
+`stringsdict.variable_name`, and `stringsdict.value_type`. The generic plural
+model does not identify which printf argument drives quantity, so the codec
+never guesses from the form text. Resources parsed from `.stringsdict` already
+carry these keys and round-trip without extra setup.
+
+The CLI therefore does not synthesize `.stringsdict` from Android XML,
+`.xcstrings`, or other generic plural inputs. Conversion to `.stringsdict`
+requires input that already carries the three selector fields.
+
+Binary input is materialized through the plist library's dictionary value, so
+duplicate keys in an adversarial binary plist cannot be detected after
+materialization.
+
+† CSV and TSV retain the conventional wide `key,<language>...` schema for
+simple singular catalogs. When that schema would discard model data, langcodec
+automatically writes the versioned `__langcodec_extended_v1` schema. The
+extended schema round-trips resource and entry order, languages, domains,
+plural identifiers and forms, comments, statuses, custom metadata, and the
+difference between an empty translation and an empty singular string. Its
+serialization is deterministic; this is a data-model guarantee, not a promise
+to preserve the original lexical formatting of an imported file.
 
 ## AI Workflows
 
 `langcodec` is built for app localization workflows, not just isolated text snippets. `translate` and `annotate` can be driven from a shared `langcodec.toml`, use supported providers such as OpenAI, Anthropic, and Gemini, and scale from single-language files or `.xcstrings` catalogs to config-driven runs across larger repos.
+
+Translation and Tolgee matching normalize case and `_`/`-` spelling while
+comparing the complete locale identity. Script and region variants such as
+`zh-Hans`/`zh-Hant` and `pt-BR`/`pt-PT` remain distinct. A bare language tag
+matches a qualified catalog locale only when the surrounding catalog or target
+path makes the choice unambiguous; otherwise the CLI requires a fully qualified
+tag.
 
 ```toml
 [openai]

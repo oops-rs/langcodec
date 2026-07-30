@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 //! Universal localization file toolkit for Rust.
 //!
-//! Supports parsing, writing, and converting between Apple `.strings`, `.xcstrings`, `.xliff`,
-//! Android `strings.xml`, CSV, and TSV files.
+//! Supports parsing, writing, and converting between Apple `.strings`, `.stringsdict`,
+//! `.xcstrings`, `.xliff`, Android `strings.xml`, CSV, and TSV files.
 //! All conversion happens through the unified `Resource` model.
 //!
 //! # Quick Start
@@ -31,18 +31,19 @@
 //! # Supported Formats
 //!
 //! - **Apple `.strings`**: Traditional iOS/macOS localization files
+//! - **Apple `.stringsdict`**: XML and binary input plus canonical XML output for one bare plural selector
 //! - **Apple `.xcstrings`**: Modern Xcode localization format with plural support
 //! - **Apple `.xliff`**: Xcode localization exchange files (XLIFF 1.2)
 //! - **Android `strings.xml`**: Android resource files
-//! - **CSV**: Comma-separated values for simple key-value pairs
-//! - **TSV**: Tab-separated values for simple key-value pairs
+//! - **CSV**: Conventional wide data plus an automatic versioned schema for lossless model data
+//! - **TSV**: Conventional wide data plus the same automatic versioned schema
 //!
 //! # Features
 //!
 //! - ✨ Parse, write, convert, and merge multiple localization file formats
 //! - 🦀 Idiomatic, modular, and ergonomic Rust API
 //! - 📦 Designed for CLI tools, CI/CD pipelines, and library integration
-//! - 🔄 Unified internal model (`Resource`) for lossless format-agnostic processing
+//! - 🔄 Unified internal model (`Resource`) with explicit errors for non-representable output
 //! - 📖 Well-documented, robust error handling and extensible codebase
 //!
 //! # Examples

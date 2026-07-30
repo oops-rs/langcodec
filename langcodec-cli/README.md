@@ -7,6 +7,7 @@ It handles the annoying parts of localization work in one place: format conversi
 Supported formats:
 
 - Apple `.strings`
+- Apple `.stringsdict` (XML/binary read, canonical XML write, single-variable plural subset)
 - Apple `.xcstrings`
 - Apple/Xcode `.xliff`
 - Android `strings.xml`
@@ -47,6 +48,14 @@ langcodec translate \
 - validates output before model requests
 - prints a clear result summary at the end
 
+Locale matching normalizes case and treats `_` and `-` as equivalent spelling,
+but it compares the complete locale identity. `zh-Hans` is not `zh-Hant`, and
+`pt-BR` is not `pt-PT`. A bare request such as `pt` resolves to a qualified
+catalog locale only when the surrounding catalog or target path makes the
+choice unambiguous; otherwise `--source-lang` or `--target-lang` must name the
+fully qualified locale.
+Duplicate normalized identities such as `fr-CA` and `fr_CA` are rejected.
+
 ### AI-generated translator comments
 
 ```sh
@@ -76,6 +85,8 @@ langcodec tolgee push --namespace WebGame
 ```
 
 Tolgee support in v1 is intentionally focused on Apple `.xcstrings`. `langcodec.toml` can now be the source of truth, and `langcodec` will synthesize the Tolgee CLI JSON config at runtime.
+Tolgee filtering and merge use the same complete normalized locale identity as
+`translate`, so sibling script or region variants are never merged implicitly.
 
 ## Install
 
@@ -94,6 +105,7 @@ Use the CLI help for exact flags:
 
 ```sh
 langcodec --help
+langcodec check --help
 langcodec translate --help
 langcodec annotate --help
 langcodec tolgee --help
@@ -105,12 +117,34 @@ langcodec tolgee --help
 
 ```sh
 langcodec convert -i Localizable.xcstrings -o translations.csv
+langcodec convert -i en.lproj/Localizable.stringsdict -o values-en/strings.xml
 langcodec convert -i translations.csv -o values/strings.xml
 langcodec convert -i Localizable.xcstrings -o Localizable.xliff --output-lang fr
 langcodec convert -i Localizable.xliff -o Localizable.xcstrings
 ```
 
-For `.xliff` output, pass `--output-lang` to choose the target language. Use `--source-language` when the source language is ambiguous.
+For a single-language input whose path does not identify its locale, pass
+`--source-language` as the input language hint:
+
+```sh
+langcodec convert \
+  -i Localizable.catalog \
+  -o values-en/strings.xml \
+  --input-format stringsdict \
+  --source-language en
+```
+
+An explicit standard `--input-format` reads that format regardless of the
+input extension, including in `--strict` mode. For `.xliff` output, pass
+`--output-lang` to choose the target language; `--source-language` continues
+to select its source language.
+
+Simple CSV and TSV files keep the conventional wide `key,<language>...`
+layout. If a conversion contains plurals, comments, statuses, domains, custom
+metadata, or other distinctions that the wide layout cannot represent,
+langcodec automatically emits the deterministic `__langcodec_extended_v1`
+schema. That schema round-trips the langcodec data model; it does not preserve
+an input file's original whitespace or quoting.
 
 ### Find strings that still need work
 
@@ -118,6 +152,24 @@ For `.xliff` output, pass `--output-lang` to choose the target language. Use `--
 langcodec view -i Localizable.xcstrings --status new,needs_review --keys-only
 langcodec stats -i Localizable.xcstrings --json
 ```
+
+### Validate files in CI
+
+```sh
+langcodec check \
+  -i 'locales/**/*.{strings,stringsdict,xml,xcstrings,xliff,csv,tsv}' \
+  --continue-on-error --json
+```
+
+`check` is read-only and exits non-zero for input/parse errors, invalid or
+duplicate normalized locale identities, invalid resource structure, missing
+locale-required plural categories, or placeholder inconsistencies. Placeholder
+signatures are normalized and compared only across singular translations that
+share the same domain and key. Plural branches receive CLDR category
+completeness checks but are not placeholder-compared: the resource model does
+not identify which printf argument is the plural quantity, and valid categories
+may independently include or omit a displayed count. `check` does not add
+missing keys, measure coverage, or modify files.
 
 ### Edit files without format-specific tooling
 
@@ -133,6 +185,15 @@ langcodec normalize -i 'locales/**/*.{strings,xml,csv,tsv,xcstrings}' --check
 ```
 
 `normalize`, `edit`, and `sync` intentionally do not operate on `.xliff` in v1; convert XLIFF into a project format first.
+
+`.stringsdict` can be converted, viewed, debugged, checked, and merged when
+every entry remains representable. Scalar editing, interactive `browse`,
+`normalize`, `annotate`, and `translate` reject it. It may be a `sync` source,
+but not a target or output, because sync provenance is not representable.
+Generic CLI inputs such as Android XML or `.xcstrings` cannot create a
+`.stringsdict`: their plural model does not identify the printf argument that
+drives quantity, and the CLI does not guess. Library callers can opt in by
+setting all three structural `Entry.custom` keys documented by `langcodec`.
 
 ### Sync or merge existing translation assets
 
@@ -202,6 +263,7 @@ For larger repos:
 ## Main Commands
 
 - `convert`: convert between localization formats
+- `check`: validate files for CI without modifying them
 - `view`: inspect entries, statuses, and keys
 - `stats`: summarize coverage and completion
 - `edit`: add, update, or remove entries
@@ -211,7 +273,7 @@ For larger repos:
 - `merge`: combine multiple inputs into one output
 - `translate`: draft translations with AI-backed providers
 - `tolgee`: pull and push mapped `.xcstrings` catalogs with Tolgee
-- `annotate`: generate translator-facing `.xcstrings` comments with AI-backed source lookup
+- `annotate`: generate translator-facing comments for `.xcstrings`, `.strings`, and Android XML using AI-backed source lookup
 - `debug`: inspect parsed output as JSON
 
 ## Best Fit

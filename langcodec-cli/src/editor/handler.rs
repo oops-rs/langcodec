@@ -46,14 +46,10 @@ fn handle_normal(app: &mut App, key: KeyEvent) -> HandlerResult {
         }
 
         // Page navigation — must come before plain j/k to avoid swallowing Ctrl+d/u
-        KeyCode::PageDown | KeyCode::Char('d')
-            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
+        KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.key_next_page(10);
         }
-        KeyCode::PageUp | KeyCode::Char('u')
-            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
+        KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.key_prev_page(10);
         }
 
@@ -211,15 +207,13 @@ fn handle_edit(app: &mut App, key: KeyEvent) -> HandlerResult {
         KeyCode::Esc => {
             app.cancel_edit();
         }
-        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            match c {
-                'a' | 'A' => app.cursor_home(),
-                'e' | 'E' => app.cursor_end(),
-                'y' | 'Y' => app.copy_from_source_lang(),
-                'c' | 'C' | 'd' | 'D' => app.cancel_edit(),
-                _ => {}
-            }
-        }
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => match c {
+            'a' | 'A' => app.cursor_home(),
+            'e' | 'E' => app.cursor_end(),
+            'y' | 'Y' => app.copy_from_source_lang(),
+            'c' | 'C' | 'd' | 'D' => app.cancel_edit(),
+            _ => {}
+        },
         KeyCode::Char(c) => {
             app.edit_insert(c);
         }

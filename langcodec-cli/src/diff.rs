@@ -178,8 +178,8 @@ pub fn run_diff_command(opts: DiffOptions) -> Result<(), String> {
         validate_output_path(output)?;
     }
 
-    let source_resources = read_resources_from_any_input(&opts.source, None, opts.strict)?;
-    let target_resources = read_resources_from_any_input(&opts.target, None, opts.strict)?;
+    let source_resources = read_resources_from_any_input(&opts.source, None, None, opts.strict)?;
+    let target_resources = read_resources_from_any_input(&opts.target, None, None, opts.strict)?;
 
     let report = diff_resources(
         &source_resources,

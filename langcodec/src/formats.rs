@@ -6,6 +6,7 @@
 pub mod android_strings;
 pub mod csv;
 pub mod strings;
+pub mod stringsdict;
 pub mod tsv;
 pub mod xcstrings;
 pub mod xliff;
@@ -19,6 +20,7 @@ use std::{
 pub use android_strings::Format as AndroidStringsFormat;
 pub use csv::{Format as CSVFormat, MultiLanguageCSVRecord};
 pub use strings::Format as StringsFormat;
+pub use stringsdict::Format as StringsdictFormat;
 pub use tsv::{Format as TSVFormat, MultiLanguageTSVRecord};
 pub use xcstrings::Format as XcstringsFormat;
 pub use xliff::Format as XliffFormat;
@@ -34,6 +36,8 @@ pub enum FormatType {
     AndroidStrings(Option<String>),
     /// Apple `.strings` format, with optional language code.
     Strings(Option<String>),
+    /// Apple `.stringsdict` plural format, with optional language code.
+    Stringsdict(Option<String>),
     /// Apple `.xcstrings` format (no language code).
     Xcstrings,
     /// Apple/Xcode `.xliff` format, with optional target language hint.
@@ -49,6 +53,7 @@ pub enum FormatType {
 /// This provides a human-friendly string for each format type:
 /// - `AndroidStrings(_)` → `"android"`
 /// - `Strings(_)` → `"strings"`
+/// - `Stringsdict(_)` → `"stringsdict"`
 /// - `Xcstrings` → `"xcstrings"`
 ///
 /// # Example
@@ -57,6 +62,7 @@ pub enum FormatType {
 /// use std::fmt::Display;
 /// assert_eq!(FormatType::AndroidStrings(None).to_string(), "android");
 /// assert_eq!(FormatType::Strings(None).to_string(), "strings");
+/// assert_eq!(FormatType::Stringsdict(None).to_string(), "stringsdict");
 /// assert_eq!(FormatType::Xcstrings.to_string(), "xcstrings");
 /// ```
 impl Display for FormatType {
@@ -64,6 +70,7 @@ impl Display for FormatType {
         match self {
             FormatType::AndroidStrings(_) => write!(f, "android"),
             FormatType::Strings(_) => write!(f, "strings"),
+            FormatType::Stringsdict(_) => write!(f, "stringsdict"),
             FormatType::Xcstrings => write!(f, "xcstrings"),
             FormatType::Xliff(_) => write!(f, "xliff"),
             FormatType::CSV => write!(f, "csv"),
@@ -77,6 +84,7 @@ impl Display for FormatType {
 /// Accepts the following case-insensitive strings:
 /// - `"android"`, `"androidstrings"`, `"xml"` → `FormatType::AndroidStrings(None)`
 /// - `"strings"` → `FormatType::Strings(None)`
+/// - `"stringsdict"` → `FormatType::Stringsdict(None)`
 /// - `"xcstrings"` → `FormatType::Xcstrings`
 ///
 /// Returns [`crate::error::Error::UnknownFormat`] for unknown strings.
@@ -87,6 +95,7 @@ impl Display for FormatType {
 /// use std::str::FromStr;
 /// assert_eq!(FormatType::from_str("android").unwrap(), FormatType::AndroidStrings(None));
 /// assert_eq!(FormatType::from_str("strings").unwrap(), FormatType::Strings(None));
+/// assert_eq!(FormatType::from_str("stringsdict").unwrap(), FormatType::Stringsdict(None));
 /// assert_eq!(FormatType::from_str("xcstrings").unwrap(), FormatType::Xcstrings);
 /// assert!(FormatType::from_str("foobar").is_err());
 /// ```
@@ -97,6 +106,7 @@ impl FromStr for FormatType {
         match s.as_str() {
             "android" | "androidstrings" | "xml" => Ok(FormatType::AndroidStrings(None)),
             "strings" => Ok(FormatType::Strings(None)),
+            "stringsdict" => Ok(FormatType::Stringsdict(None)),
             "xcstrings" => Ok(FormatType::Xcstrings),
             "xliff" => Ok(FormatType::Xliff(None)),
             "csv" => Ok(FormatType::CSV),
@@ -112,6 +122,7 @@ impl FormatType {
         match self {
             FormatType::AndroidStrings(_) => "xml",
             FormatType::Strings(_) => "strings",
+            FormatType::Stringsdict(_) => "stringsdict",
             FormatType::Xcstrings => "xcstrings",
             FormatType::Xliff(_) => "xliff",
             FormatType::CSV => "csv",
@@ -124,6 +135,7 @@ impl FormatType {
         match self {
             FormatType::AndroidStrings(lang) => lang.as_ref(),
             FormatType::Strings(lang) => lang.as_ref(),
+            FormatType::Stringsdict(lang) => lang.as_ref(),
             FormatType::Xcstrings => None,
             FormatType::Xliff(lang) => lang.as_ref(),
             FormatType::CSV => None,
@@ -136,6 +148,7 @@ impl FormatType {
         match self {
             FormatType::AndroidStrings(_) => FormatType::AndroidStrings(lang),
             FormatType::Strings(_) => FormatType::Strings(lang),
+            FormatType::Stringsdict(_) => FormatType::Stringsdict(lang),
             FormatType::Xcstrings => FormatType::Xcstrings,
             FormatType::Xliff(_) => FormatType::Xliff(lang),
             FormatType::CSV => FormatType::CSV,
@@ -187,6 +200,7 @@ mod tests {
     fn test_format_type_display() {
         assert_eq!(FormatType::AndroidStrings(None).to_string(), "android");
         assert_eq!(FormatType::Strings(None).to_string(), "strings");
+        assert_eq!(FormatType::Stringsdict(None).to_string(), "stringsdict");
         assert_eq!(FormatType::Xcstrings.to_string(), "xcstrings");
         assert_eq!(FormatType::Xliff(None).to_string(), "xliff");
         assert_eq!(FormatType::CSV.to_string(), "csv");
@@ -221,6 +235,14 @@ mod tests {
         assert_eq!(
             FormatType::from_str("STRINGS").unwrap(),
             FormatType::Strings(None)
+        );
+        assert_eq!(
+            FormatType::from_str("stringsdict").unwrap(),
+            FormatType::Stringsdict(None)
+        );
+        assert_eq!(
+            FormatType::from_str("STRINGSDICT").unwrap(),
+            FormatType::Stringsdict(None)
         );
 
         // Xcstrings format
@@ -274,6 +296,7 @@ mod tests {
     fn test_format_type_extension() {
         assert_eq!(FormatType::AndroidStrings(None).extension(), "xml");
         assert_eq!(FormatType::Strings(None).extension(), "strings");
+        assert_eq!(FormatType::Stringsdict(None).extension(), "stringsdict");
         assert_eq!(FormatType::Xcstrings.extension(), "xcstrings");
         assert_eq!(FormatType::CSV.extension(), "csv");
         assert_eq!(FormatType::TSV.extension(), "tsv");
@@ -288,6 +311,10 @@ mod tests {
         assert_eq!(
             FormatType::Strings(Some("fr".to_string())).language(),
             Some(&"fr".to_string())
+        );
+        assert_eq!(
+            FormatType::Stringsdict(Some("ar".to_string())).language(),
+            Some(&"ar".to_string())
         );
         assert_eq!(FormatType::Xcstrings.language(), None);
         assert_eq!(FormatType::CSV.language(), None);

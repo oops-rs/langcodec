@@ -809,8 +809,15 @@ impl Codec {
         problems
     }
 
-    /// Normalize placeholders in all entries (mutates in place).
+    /// Normalize placeholders in ordinary entries (mutates in place).
     /// Converts iOS patterns like `%@`, `%1$@`, `%ld` to canonical forms (%s, %1$s, %d/%u).
+    ///
+    /// Entries carrying any Apple `.stringsdict` structural custom key are
+    /// skipped, including entries with only partial structural metadata.
+    /// Rewriting those printf tokens could make the retained selector value
+    /// type inconsistent with the translation. Use the fallible
+    /// [`crate::normalize_codec`] API when callers need an explicit error for
+    /// this condition.
     ///
     /// Example
     /// ```rust
@@ -829,6 +836,10 @@ impl Codec {
         use crate::types::Translation;
         for res in &mut self.resources {
             for entry in &mut res.entries {
+                if crate::normalize::has_stringsdict_structural_metadata(entry) {
+                    continue;
+                }
+
                 match &mut entry.value {
                     Translation::Empty => {
                         continue;
@@ -948,7 +959,8 @@ impl Codec {
     /// ```
     pub fn write_resource_to_file(resource: &Resource, output_path: &str) -> Result<(), Error> {
         use crate::formats::{
-            AndroidStringsFormat, CSVFormat, StringsFormat, TSVFormat, XcstringsFormat,
+            AndroidStringsFormat, CSVFormat, StringsFormat, StringsdictFormat, TSVFormat,
+            XcstringsFormat,
         };
         use std::path::Path;
 
@@ -963,43 +975,25 @@ impl Codec {
 
         match format_type {
             crate::formats::FormatType::AndroidStrings(_) => {
-                AndroidStringsFormat::from(resource.clone())
-                    .write_to(Path::new(output_path))
-                    .map_err(|e| {
-                        Error::conversion_error(
-                            format!("Error writing AndroidStrings output: {}", e),
-                            None,
-                        )
-                    })
+                AndroidStringsFormat::from(resource.clone()).write_to(Path::new(output_path))
             }
             crate::formats::FormatType::Strings(_) => StringsFormat::try_from(resource.clone())
-                .and_then(|f| f.write_to(Path::new(output_path)))
-                .map_err(|e| {
-                    Error::conversion_error(format!("Error writing Strings output: {}", e), None)
-                }),
+                .and_then(|format| format.write_to(Path::new(output_path))),
+            crate::formats::FormatType::Stringsdict(_) => {
+                StringsdictFormat::try_from(resource.clone())
+                    .and_then(|format| format.write_to(Path::new(output_path)))
+            }
             crate::formats::FormatType::Xcstrings => {
                 XcstringsFormat::try_from(vec![resource.clone()])
-                    .and_then(|f| f.write_to(Path::new(output_path)))
-                    .map_err(|e| {
-                        Error::conversion_error(
-                            format!("Error writing Xcstrings output: {}", e),
-                            None,
-                        )
-                    })
+                    .and_then(|format| format.write_to(Path::new(output_path)))
             }
             crate::formats::FormatType::Xliff(_) => Err(Error::InvalidResource(
                 "XLIFF output requires both source and target resources; use convert_resources_to_format instead of write_resource_to_file".to_string(),
             )),
             crate::formats::FormatType::CSV => CSVFormat::try_from(vec![resource.clone()])
-                .and_then(|f| f.write_to(Path::new(output_path)))
-                .map_err(|e| {
-                    Error::conversion_error(format!("Error writing CSV output: {}", e), None)
-                }),
+                .and_then(|format| format.write_to(Path::new(output_path))),
             crate::formats::FormatType::TSV => TSVFormat::try_from(vec![resource.clone()])
-                .and_then(|f| f.write_to(Path::new(output_path)))
-                .map_err(|e| {
-                    Error::conversion_error(format!("Error writing TSV output: {}", e), None)
-                }),
+                .and_then(|format| format.write_to(Path::new(output_path))),
         }
     }
 
@@ -1030,9 +1024,9 @@ impl Codec {
     ) -> Result<(), Error> {
         let inferred_language = crate::converter::infer_language_from_path(&path, &format_type)?;
         let format_language = match &format_type {
-            FormatType::Strings(lang_opt) | FormatType::AndroidStrings(lang_opt) => {
-                lang_opt.clone()
-            }
+            FormatType::Strings(lang_opt)
+            | FormatType::Stringsdict(lang_opt)
+            | FormatType::AndroidStrings(lang_opt) => lang_opt.clone(),
             FormatType::Xliff(lang_opt) => lang_opt.clone(),
             _ => None,
         };
@@ -1040,11 +1034,11 @@ impl Codec {
         let language = options
             .language_hint
             .clone()
-            .or(inferred_language)
-            .or(format_language);
+            .or(format_language)
+            .or(inferred_language);
         let requires_language = matches!(
             &format_type,
-            FormatType::Strings(_) | FormatType::AndroidStrings(_)
+            FormatType::Strings(_) | FormatType::Stringsdict(_) | FormatType::AndroidStrings(_)
         );
         let format_name = format_type.to_string();
         let source_path = path.as_ref().to_string_lossy().to_string();
@@ -1064,9 +1058,13 @@ impl Codec {
             .to_string();
         let path = path.as_ref();
 
+        let mut preserve_parsed_metadata = false;
         let mut new_resources = match &format_type {
             FormatType::Strings(_) => {
                 vec![Resource::from(StringsFormat::read_from(path)?)]
+            }
+            FormatType::Stringsdict(_) => {
+                vec![Resource::from(StringsdictFormat::read_from(path)?)]
             }
             FormatType::AndroidStrings(_) => {
                 vec![Resource::from(AndroidStringsFormat::read_from(path)?)]
@@ -1076,11 +1074,13 @@ impl Codec {
             FormatType::CSV => {
                 // Parse CSV format and convert to resources
                 let csv_format = CSVFormat::read_from(path)?;
+                preserve_parsed_metadata = csv_format.is_extended();
                 Vec::<Resource>::try_from(csv_format)?
             }
             FormatType::TSV => {
                 // Parse TSV format and convert to resources
                 let tsv_format = TSVFormat::read_from(path)?;
+                preserve_parsed_metadata = tsv_format.is_extended();
                 Vec::<Resource>::try_from(tsv_format)?
             }
         };
@@ -1089,11 +1089,13 @@ impl Codec {
             if requires_language && let Some(ref lang) = language {
                 new_resource.metadata.language = lang.clone();
             }
-            new_resource.metadata.domain = domain.clone();
-            new_resource
-                .metadata
-                .custom
-                .insert("format".to_string(), format_name.clone());
+            if !preserve_parsed_metadata {
+                new_resource.metadata.domain = domain.clone();
+                new_resource
+                    .metadata
+                    .custom
+                    .insert("format".to_string(), format_name.clone());
+            }
 
             if options.attach_provenance {
                 set_resource_provenance(
@@ -1140,6 +1142,7 @@ impl Codec {
         let format_type = match path.as_ref().extension().and_then(|s| s.to_str()) {
             Some("xml") => FormatType::AndroidStrings(options.language_hint.clone()),
             Some("strings") => FormatType::Strings(options.language_hint.clone()),
+            Some("stringsdict") => FormatType::Stringsdict(options.language_hint.clone()),
             Some("xcstrings") => FormatType::Xcstrings,
             Some("xliff") => FormatType::Xliff(None),
             Some("csv") => FormatType::CSV,
@@ -2009,6 +2012,78 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_placeholders_in_place_skips_stringsdict_structural_entries() {
+        use crate::formats::stringsdict::{
+            LOCALIZED_FORMAT_CUSTOM_KEY, VALUE_TYPE_CUSTOM_KEY, VARIABLE_NAME_CUSTOM_KEY,
+        };
+
+        let mut structural_custom = HashMap::new();
+        structural_custom.insert(
+            LOCALIZED_FORMAT_CUSTOM_KEY.to_string(),
+            "%#@count@".to_string(),
+        );
+        structural_custom.insert(VARIABLE_NAME_CUSTOM_KEY.to_string(), "count".to_string());
+        structural_custom.insert(VALUE_TYPE_CUSTOM_KEY.to_string(), "ld".to_string());
+
+        let mut partial_custom = HashMap::new();
+        partial_custom.insert(VALUE_TYPE_CUSTOM_KEY.to_string(), "lu".to_string());
+
+        let mut codec = Codec::new();
+        codec.add_resource(Resource {
+            metadata: Metadata {
+                language: "en".into(),
+                domain: "d".into(),
+                custom: HashMap::new(),
+            },
+            entries: vec![
+                Entry {
+                    id: "count".into(),
+                    value: Translation::Singular("%ld files".into()),
+                    comment: None,
+                    status: EntryStatus::Translated,
+                    custom: structural_custom,
+                },
+                Entry {
+                    id: "partial".into(),
+                    value: Translation::Singular("%lu bytes".into()),
+                    comment: None,
+                    status: EntryStatus::Translated,
+                    custom: partial_custom,
+                },
+                Entry {
+                    id: "ordinary".into(),
+                    value: Translation::Singular("Hello %@".into()),
+                    comment: None,
+                    status: EntryStatus::Translated,
+                    custom: HashMap::new(),
+                },
+            ],
+        });
+
+        codec.normalize_placeholders_in_place();
+
+        assert_eq!(
+            codec.resources[0].entries[0].value,
+            Translation::Singular("%ld files".into())
+        );
+        assert_eq!(
+            codec.resources[0].entries[0]
+                .custom
+                .get(VALUE_TYPE_CUSTOM_KEY)
+                .map(String::as_str),
+            Some("ld")
+        );
+        assert_eq!(
+            codec.resources[0].entries[1].value,
+            Translation::Singular("%lu bytes".into())
+        );
+        assert_eq!(
+            codec.resources[0].entries[2].value,
+            Translation::Singular("Hello %s".into())
+        );
+    }
+
+    #[test]
     fn test_read_file_by_type_with_strict_requires_language() {
         let temp = tempfile::tempdir().unwrap();
         let input = temp.path().join("Localizable.strings");
@@ -2023,6 +2098,41 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.error_code(), crate::ErrorCode::MissingLanguage);
+    }
+
+    #[test]
+    fn test_read_file_language_precedence_is_hint_then_format_then_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let locale_directory = temp.path().join("fr.lproj");
+        std::fs::create_dir_all(&locale_directory).unwrap();
+        let input = locale_directory.join("Localizable.strings");
+        std::fs::write(&input, "\"hello\" = \"Hello\";").unwrap();
+
+        let mut explicit_format_codec = Codec::new();
+        explicit_format_codec
+            .read_file_by_type_with_options(
+                &input,
+                FormatType::Strings(Some("de".to_string())),
+                &ReadOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            explicit_format_codec.resources[0].metadata.language, "de",
+            "the explicit format language must outrank the fr.lproj path"
+        );
+
+        let mut hinted_codec = Codec::new();
+        hinted_codec
+            .read_file_by_type_with_options(
+                &input,
+                FormatType::Strings(Some("de".to_string())),
+                &ReadOptions::new().with_language_hint(Some("es".to_string())),
+            )
+            .unwrap();
+        assert_eq!(
+            hinted_codec.resources[0].metadata.language, "es",
+            "the read option hint must outrank both the format language and path"
+        );
     }
 
     #[test]

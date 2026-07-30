@@ -647,7 +647,17 @@ fn test_convert_command_output_to_tsv() {
     assert!(output_file.exists());
 
     let output_content = fs::read_to_string(&output_file).unwrap();
-    assert!(output_content.contains("key\ten\tfr"));
+    assert!(output_content.starts_with("__langcodec_extended_v1\trow_kind\t"));
+    let mut languages = output_content
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let columns = line.split('\t').collect::<Vec<_>>();
+            (columns.get(1) == Some(&"resource")).then(|| columns[4])
+        })
+        .collect::<Vec<_>>();
+    languages.sort_unstable();
+    assert_eq!(languages, vec!["en", "fr"]);
 }
 
 #[test]

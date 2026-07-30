@@ -1,4 +1,4 @@
-use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use std::{
     collections::{BTreeMap, HashMap},
     io::{BufRead, Write},
@@ -656,14 +656,16 @@ mod tests {
         let files = fmt.strings.get("files").expect("files item");
         let en_p = files.localizations.get("en").expect("en loc");
         let plural_map = en_p.variations.as_ref().unwrap().plural.as_ref().unwrap();
-        assert!(plural_map
-            .get(&PluralCategory::One)
-            .unwrap()
-            .string_unit
-            .as_ref()
-            .unwrap()
-            .value
-            .contains("%1$@"));
+        assert!(
+            plural_map
+                .get(&PluralCategory::One)
+                .unwrap()
+                .string_unit
+                .as_ref()
+                .unwrap()
+                .value
+                .contains("%1$@")
+        );
     }
 
     #[test]

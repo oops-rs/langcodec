@@ -41,7 +41,7 @@ To add support for a new localization format:
 1. Create a new module in `langcodec/src/formats/`
 2. Implement the `Parser` trait for your format
 3. Add `From`/`TryFrom` conversions to/from `Resource`
-4. Update `FormatType` enum in `formats/mod.rs`
+4. Update `FormatType` in `langcodec/src/formats.rs`
 5. Add tests in the appropriate test module
 
 ### Testing
@@ -64,7 +64,7 @@ Follow the Conventional Commits specification to keep history readable and enabl
 
 - Use the format: `<type>(<scope>): <subject>`
 - type: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
-- scope (optional): one of lib, cli, formats, formats/android, formats/strings, formats/xcstrings, formats/csv, formats/tsv, transformers, validation, docs, tests
+- scope (optional): one of lib, cli, formats, formats/android, formats/strings, formats/stringsdict, formats/xcstrings, formats/xliff, formats/csv, formats/tsv, transformers, validation, docs, tests
 - subject: imperative mood, lowercase, ≤ 72 characters, no trailing period
 - Separate body from subject with a blank line; explain motivation and impact
 - Reference issues in the body or footer (e.g., Refs #123 or Fixes #123)

@@ -19,6 +19,7 @@ use langcodec::{
     convert_resources_to_format,
     formats::{AndroidStringsFormat, CSVFormat, StringsFormat, TSVFormat, XcstringsFormat},
     infer_format_from_extension, infer_language_from_path,
+    placeholder::signature,
     traits::Parser,
 };
 use mentra::provider::{
@@ -474,10 +475,13 @@ async fn async_run_translation(
                         source_comment: job.source_comment.clone(),
                     })
                     .await
-                    .map(|translated_value| TranslationResult {
-                        key: job.key.clone(),
-                        target_lang: job.target_lang.clone(),
-                        translated_value,
+                    .and_then(|translated_value| {
+                        validate_generated_translation(&job, &translated_value)?;
+                        Ok(TranslationResult {
+                            key: job.key.clone(),
+                            target_lang: job.target_lang.clone(),
+                            translated_value,
+                        })
                     });
                 let _ = tx.send(TranslationWorkerUpdate::Finished { id, result });
             }
@@ -585,18 +589,9 @@ async fn async_run_translation(
         tone: DashboardLogTone::Info,
         message: "Applying translated values".to_string(),
     });
-    if let Err(err) = validate_translated_output(&prepared) {
-        reporter.emit(DashboardEvent::Log {
-            tone: DashboardLogTone::Error,
-            message: err.clone(),
-        });
-        reporter.finish()?;
-        print_summary(&prepared.summary);
-        return Err(err);
-    }
     reporter.emit(DashboardEvent::Log {
         tone: DashboardLogTone::Success,
-        message: "Placeholder validation passed".to_string(),
+        message: "Generated placeholder validation passed".to_string(),
     });
 
     if prepared.opts.dry_run {
@@ -671,10 +666,12 @@ fn prepare_translation(opts: &TranslateOptions) -> Result<PreparedTranslation, S
 
     validate_path_inputs(&resolved)?;
 
+    let has_explicit_target = resolved.target.is_some();
     let source_path = resolved.source.clone();
     let target_path = resolved
         .target
         .clone()
+        .or_else(|| resolved.output.clone())
         .unwrap_or_else(|| resolved.source.clone());
     let output_path = resolved
         .output
@@ -683,9 +680,73 @@ fn prepare_translation(opts: &TranslateOptions) -> Result<PreparedTranslation, S
 
     let output_format = infer_format_from_extension(&output_path)
         .ok_or_else(|| format!("Cannot infer output format from path: {}", output_path))?;
-    let output_lang_hint = infer_language_from_path(&output_path, &output_format)
-        .ok()
+    let source_format = infer_format_from_extension(&source_path);
+    let target_format = if has_explicit_target {
+        infer_format_from_extension(&target_path)
+    } else {
+        None
+    };
+    let target_exists = Path::new(&target_path).is_file();
+    if [&source_path, &target_path, &output_path]
+        .into_iter()
+        .any(|path| {
+            matches!(
+                infer_format_from_extension(path),
+                Some(FormatType::Stringsdict(_))
+            )
+        })
+    {
+        return Err(
+            ".stringsdict is not supported by `translate` until plural-aware translation is implemented."
+                .to_string(),
+        );
+    }
+    let source_path_lang_hint = source_format
+        .as_ref()
+        .map(|format| infer_path_language(&source_path, format))
+        .transpose()?
         .flatten();
+    let output_lang_hint = infer_path_language(&output_path, &output_format)?;
+    let target_lang_hint = if let Some(target_format) = target_format.as_ref() {
+        infer_path_language(&target_path, target_format)?
+    } else {
+        None
+    };
+    let source_intrinsic_lang_hint = if source_path_lang_hint.is_none() {
+        source_format
+            .as_ref()
+            .map(|format| infer_intrinsic_language(&source_path, format))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let target_intrinsic_lang_hint = if target_exists && target_lang_hint.is_none() {
+        target_format
+            .as_ref()
+            .map(|format| infer_intrinsic_language(&target_path, format))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let target_identity_hint = target_lang_hint
+        .as_deref()
+        .or(target_intrinsic_lang_hint.as_deref());
+    let target_is_source = Path::new(&target_path) == Path::new(&source_path);
+    let target_is_distinct = has_explicit_target && !target_is_source;
+
+    if target_is_distinct
+        && Path::new(&target_path) != Path::new(&output_path)
+        && let (Some(target_lang), Some(output_lang)) =
+            (target_identity_hint, output_lang_hint.as_deref())
+        && !language_identity_eq(target_lang, output_lang)
+    {
+        return Err(format!(
+            "Target path '{}' identifies language '{}' but output path '{}' identifies language '{}'; refusing to retag the target locale",
+            target_path, target_lang, output_path, output_lang
+        ));
+    }
 
     if !is_multi_language_format(&output_format) && resolved.target_langs.len() > 1 {
         return Err(
@@ -694,7 +755,7 @@ fn prepare_translation(opts: &TranslateOptions) -> Result<PreparedTranslation, S
         );
     }
 
-    if opts.target.is_none()
+    if !has_explicit_target
         && output_path == source_path
         && !is_multi_language_format(&output_format)
     {
@@ -704,32 +765,69 @@ fn prepare_translation(opts: &TranslateOptions) -> Result<PreparedTranslation, S
         );
     }
 
-    let source_codec = read_codec(&source_path, resolved.source_lang.clone(), resolved.strict)?;
+    let source_read_hint = if source_format
+        .as_ref()
+        .is_some_and(format_requires_external_language)
+        && source_path_lang_hint.is_none()
+    {
+        source_intrinsic_lang_hint
+            .clone()
+            .or_else(|| resolved.source_lang.clone())
+    } else {
+        None
+    };
+    let source_codec = read_codec(&source_path, source_read_hint, resolved.strict)?;
+    validate_unique_language_identities(&source_codec, "Source catalog")?;
     let source_resource = select_source_resource(&source_codec, &resolved.source_lang)?;
 
-    let mut target_codec = if Path::new(&target_path).exists() {
-        read_codec(&target_path, output_lang_hint.clone(), resolved.strict)?
+    let target_read_hint = if target_is_distinct && target_exists {
+        resolve_existing_target_read_hint(
+            &target_path,
+            target_format.as_ref(),
+            target_identity_hint,
+            &output_path,
+            &output_format,
+            output_lang_hint.as_deref(),
+            &resolved.target_langs,
+        )?
+    } else {
+        target_lang_hint.clone()
+    };
+    let mut target_codec = if target_is_distinct && target_exists {
+        read_codec(&target_path, target_read_hint, resolved.strict)?
+    } else if (has_explicit_target && target_is_source)
+        || (!has_explicit_target && is_multi_language_format(&output_format))
+    {
+        source_codec.clone()
     } else {
         Codec::new()
     };
-
-    if !Path::new(&target_path).exists() && is_multi_language_format(&output_format) {
-        ensure_resource_exists(
-            &mut target_codec,
-            &source_resource.resource,
-            &source_resource.language,
-            true,
-        );
-    }
+    validate_unique_language_identities(&target_codec, "Target catalog")?;
+    let explicit_target_lang_hint = if target_is_distinct {
+        target_identity_hint
+    } else {
+        None
+    };
 
     let target_languages = resolve_target_languages(
         &target_codec,
         &resolved.target_langs,
+        explicit_target_lang_hint,
         output_lang_hint.as_deref(),
     )?;
+    if !is_multi_language_format(&output_format)
+        && let (Some(target_lang), Some(output_lang)) =
+            (target_languages.first(), output_lang_hint.as_deref())
+        && !language_identity_eq(target_lang, output_lang)
+    {
+        return Err(format!(
+            "Target language '{}' is incompatible with output path '{}' language '{}'; use a matching output locale",
+            target_lang, output_path, output_lang
+        ));
+    }
     if let Some(target_language) = target_languages
         .iter()
-        .find(|language| lang_matches(&source_resource.language, language))
+        .find(|language| language_identity_eq(&source_resource.language, language))
     {
         return Err(format!(
             "Source language '{}' and target language '{}' must differ",
@@ -738,6 +836,14 @@ fn prepare_translation(opts: &TranslateOptions) -> Result<PreparedTranslation, S
     }
     resolved.target_langs = target_languages;
 
+    if target_is_distinct && !target_exists && is_multi_language_format(&output_format) {
+        ensure_resource_exists(
+            &mut target_codec,
+            &source_resource.resource,
+            &source_resource.language,
+            true,
+        );
+    }
     for target_lang in &resolved.target_langs {
         ensure_target_resource(&mut target_codec, target_lang)?;
     }
@@ -754,6 +860,7 @@ fn prepare_translation(opts: &TranslateOptions) -> Result<PreparedTranslation, S
         &resolved.target_langs,
         resolved.strict,
     )?;
+    validate_unique_language_identities(&target_codec, "Target catalog")?;
 
     let (jobs, summary) = build_jobs(
         &source_resource.resource,
@@ -932,10 +1039,11 @@ fn apply_translation_results(
             continue;
         };
 
-        if let Some(existing) = prepared
-            .target_codec
-            .find_entry_mut(&job.key, &job.target_lang)
-        {
+        if let Some(existing) = find_entry_mut_by_language_identity(
+            &mut prepared.target_codec,
+            &job.key,
+            &job.target_lang,
+        ) {
             existing.value = Translation::Singular(translated_value.clone());
             existing.status = prepared.opts.output_status.clone();
         } else {
@@ -956,17 +1064,27 @@ fn apply_translation_results(
     Ok(())
 }
 
-fn validate_translated_output(prepared: &PreparedTranslation) -> Result<(), String> {
-    let mut validation_codec = prepared.target_codec.clone();
-    ensure_resource_exists(
-        &mut validation_codec,
-        &prepared.source_resource.resource,
-        &prepared.source_resource.language,
-        false,
-    );
-    validation_codec
-        .validate_placeholders(prepared.opts.strict)
-        .map_err(|e| format!("Placeholder validation failed after translation: {}", e))
+fn validate_generated_translation(
+    job: &TranslationJob,
+    translated_value: &str,
+) -> Result<(), String> {
+    if translated_value.trim().is_empty() {
+        return Err(format!(
+            "Translation for key '{}' and language '{}' was blank",
+            job.key, job.target_lang
+        ));
+    }
+
+    let source_signature = signature(&job.source_value);
+    let translated_signature = signature(translated_value);
+    if source_signature != translated_signature {
+        return Err(format!(
+            "Translation for key '{}' and language '{}' changed placeholders: source {:?}, translated {:?}",
+            job.key, job.target_lang, source_signature, translated_signature
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_translation_preflight(prepared: &PreparedTranslation) -> Result<(), String> {
@@ -990,10 +1108,7 @@ fn validate_output_serialization(
             let target_lang = target_lang.ok_or_else(|| {
                 "Single-language outputs require exactly one target language".to_string()
             })?;
-            let resource = codec
-                .resources
-                .iter()
-                .find(|item| lang_matches(&item.metadata.language, target_lang))
+            let resource = find_resource_by_language_identity(codec, target_lang)
                 .ok_or_else(|| format!("Target language '{}' not found in output", target_lang))?;
             let format = StringsFormat::try_from(resource.clone())
                 .map_err(|e| format!("Error building Strings output: {}", e))?;
@@ -1006,10 +1121,7 @@ fn validate_output_serialization(
             let target_lang = target_lang.ok_or_else(|| {
                 "Single-language outputs require exactly one target language".to_string()
             })?;
-            let resource = codec
-                .resources
-                .iter()
-                .find(|item| lang_matches(&item.metadata.language, target_lang))
+            let resource = find_resource_by_language_identity(codec, target_lang)
                 .ok_or_else(|| format!("Target language '{}' not found in output", target_lang))?;
             let format = AndroidStringsFormat::from(resource.clone());
             let mut out = Vec::new();
@@ -1017,6 +1129,10 @@ fn validate_output_serialization(
                 .to_writer(&mut out)
                 .map_err(|e| format!("Error serializing Android output: {}", e))
         }
+        FormatType::Stringsdict(_) => Err(
+            ".stringsdict is not supported by `translate` until plural-aware translation is implemented."
+                .to_string(),
+        ),
         FormatType::Xcstrings => {
             let format = XcstringsFormat::try_from(codec.resources.clone())
                 .map_err(|e| format!("Error building Xcstrings output: {}", e))?;
@@ -1085,7 +1201,8 @@ fn build_jobs(
                 Translation::Singular(text) => text,
             };
 
-            let target_entry = target_codec.find_entry(&entry.id, target_lang);
+            let target_entry =
+                find_entry_by_language_identity(target_codec, &entry.id, target_lang);
 
             if target_entry.is_some_and(|item| item.status == EntryStatus::DoNotTranslate) {
                 summary.skipped_do_not_translate += 1;
@@ -1129,7 +1246,7 @@ fn effective_target_status(entry: &Entry, explicit_target_status: bool) -> Entry
 }
 
 fn ensure_target_resource(codec: &mut Codec, language: &str) -> Result<(), String> {
-    if codec.get_by_language(language).is_none() {
+    if find_resource_by_language_identity(codec, language).is_none() {
         codec.add_resource(Resource {
             metadata: Metadata {
                 language: language.to_string(),
@@ -1148,7 +1265,7 @@ fn ensure_resource_exists(
     language: &str,
     clone_entries: bool,
 ) {
-    if codec.get_by_language(language).is_some() {
+    if find_resource_by_language_identity(codec, language).is_some() {
         return;
     }
 
@@ -1395,6 +1512,84 @@ where
     Ok(parsed)
 }
 
+fn infer_path_language(path: &str, format: &FormatType) -> Result<Option<String>, String> {
+    infer_language_from_path(path, format)
+        .map_err(|err| format!("Failed to infer language from '{}': {}", path, err))
+}
+
+fn infer_intrinsic_language(path: &str, format: &FormatType) -> Result<Option<String>, String> {
+    let language = match format {
+        FormatType::Strings(_) => {
+            StringsFormat::read_from(path)
+                .map_err(|err| format!("Failed to inspect language in '{}': {}", path, err))?
+                .language
+        }
+        _ => return Ok(None),
+    };
+
+    if language.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(language))
+    }
+}
+
+fn format_requires_external_language(format: &FormatType) -> bool {
+    matches!(
+        format,
+        FormatType::Strings(_) | FormatType::Stringsdict(_) | FormatType::AndroidStrings(_)
+    )
+}
+
+fn resolve_existing_target_read_hint(
+    target_path: &str,
+    target_format: Option<&FormatType>,
+    target_path_language: Option<&str>,
+    output_path: &str,
+    output_format: &FormatType,
+    output_path_language: Option<&str>,
+    requested_languages: &[String],
+) -> Result<Option<String>, String> {
+    if let Some(language) = target_path_language {
+        return Ok(Some(language.to_string()));
+    }
+
+    if !target_format.is_some_and(format_requires_external_language) {
+        return Ok(None);
+    }
+
+    let [requested_language] = requested_languages else {
+        return Err(format!(
+            "Existing single-language target '{}' has no locale identity and cannot be assigned unambiguously to requested target languages [{}]; use a locale-identifying target path or exactly one --target-lang",
+            target_path,
+            requested_languages.join(", ")
+        ));
+    };
+
+    let separate_output_language = if Path::new(target_path) != Path::new(output_path)
+        && format_requires_external_language(output_format)
+    {
+        output_path_language
+    } else {
+        None
+    };
+
+    if let Some(output_language) = separate_output_language {
+        let compatible = language_identity_eq(requested_language, output_language)
+            || (is_bare_language(requested_language)
+                && primary_language(requested_language) == primary_language(output_language));
+        if !compatible {
+            return Err(format!(
+                "Requested target language '{}' is incompatible with separate output path '{}' language '{}'; refusing to retag the identity-less target '{}'",
+                requested_language, output_path, output_language, target_path
+            ));
+        }
+        return Ok(Some(output_language.to_string()));
+    }
+
+    Ok(Some(requested_language.clone()))
+}
+
 fn read_codec(path: &str, language_hint: Option<String>, strict: bool) -> Result<Codec, String> {
     let mut codec = Codec::new();
     codec
@@ -1413,19 +1608,23 @@ fn select_source_resource(
     requested_lang: &Option<String>,
 ) -> Result<SelectedResource, String> {
     if let Some(lang) = requested_lang {
-        if let Some(resource) = codec
-            .resources
-            .iter()
-            .find(|item| lang_matches(&item.metadata.language, lang))
+        let resolved = resolve_language_tag(
+            lang,
+            codec
+                .resources
+                .iter()
+                .map(|resource| resource.metadata.language.as_str()),
+            "Source",
+            "--source-lang",
+        )?
+        .ok_or_else(|| format!("Source language '{}' not found", lang))?;
+        let resource = find_resource_by_language_identity(codec, &resolved)
             .cloned()
-        {
-            return Ok(SelectedResource {
-                language: resource.metadata.language.clone(),
-                resource,
-            });
-        }
-
-        return Err(format!("Source language '{}' not found", lang));
+            .ok_or_else(|| format!("Source language '{}' not found", lang))?;
+        return Ok(SelectedResource {
+            language: resource.metadata.language.clone(),
+            resource,
+        });
     }
 
     if codec.resources.len() == 1 {
@@ -1442,28 +1641,66 @@ fn select_source_resource(
 fn resolve_target_languages(
     codec: &Codec,
     requested_langs: &[String],
+    inferred_from_target: Option<&str>,
     inferred_from_output: Option<&str>,
 ) -> Result<Vec<String>, String> {
     let mut resolved: Vec<String> = Vec::new();
-
-    for requested_lang in requested_langs {
-        let canonical = if let Some(resource) = codec
-            .resources
+    let available_languages = codec
+        .resources
+        .iter()
+        .map(|resource| resource.metadata.language.as_str())
+        .chain(inferred_from_output)
+        .collect::<Vec<_>>();
+    let target_binding_index = inferred_from_target.and_then(|target_language| {
+        requested_langs
             .iter()
-            .find(|item| lang_matches(&item.metadata.language, requested_lang))
-        {
-            resource.metadata.language.clone()
-        } else if let Some(inferred) = inferred_from_output
-            && lang_matches(inferred, requested_lang)
-        {
-            inferred.to_string()
+            .position(|requested| language_identity_eq(requested, target_language))
+            .or_else(|| {
+                requested_langs.iter().position(|requested| {
+                    is_bare_language(requested)
+                        && primary_language(requested) == primary_language(target_language)
+                })
+            })
+    });
+
+    for (requested_index, requested_lang) in requested_langs.iter().enumerate() {
+        let canonical = if target_binding_index == Some(requested_index) {
+            let target_language =
+                inferred_from_target.expect("target binding requires an inferred target language");
+            find_resource_by_language_identity(codec, target_language)
+                .map(|resource| resource.metadata.language.clone())
+                .unwrap_or_else(|| target_language.to_string())
+        } else if let Some(target_language) = inferred_from_target {
+            if target_binding_index.is_none()
+                && !is_bare_language(requested_lang)
+                && primary_language(requested_lang) == primary_language(target_language)
+            {
+                return Err(format!(
+                    "Requested target language '{}' conflicts with explicit target path language '{}'; refusing to retag the target locale",
+                    requested_lang, target_language
+                ));
+            } else {
+                resolve_language_tag(
+                    requested_lang,
+                    available_languages.iter().copied(),
+                    "Target",
+                    "--target-lang",
+                )?
+                .unwrap_or_else(|| requested_lang.to_string())
+            }
         } else {
-            requested_lang.to_string()
+            resolve_language_tag(
+                requested_lang,
+                available_languages.iter().copied(),
+                "Target",
+                "--target-lang",
+            )?
+            .unwrap_or_else(|| requested_lang.to_string())
         };
 
         if !resolved
             .iter()
-            .any(|existing| normalize_lang(existing) == normalize_lang(&canonical))
+            .any(|existing| language_identity_eq(existing, &canonical))
         {
             resolved.push(canonical);
         }
@@ -1472,20 +1709,149 @@ fn resolve_target_languages(
     Ok(resolved)
 }
 
-fn lang_matches(resource_lang: &str, requested_lang: &str) -> bool {
-    normalize_lang(resource_lang) == normalize_lang(requested_lang)
-        || normalize_lang(resource_lang)
-            .split('-')
-            .next()
-            .unwrap_or(resource_lang)
-            == normalize_lang(requested_lang)
+fn is_bare_language(language: &str) -> bool {
+    !normalize_lang(language).contains('-')
+}
+
+fn primary_language(language: &str) -> String {
+    normalize_lang(language)
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn resolve_language_tag<'a, I>(
+    requested: &str,
+    available: I,
+    subject: &str,
+    option: &str,
+) -> Result<Option<String>, String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let available = available.into_iter().collect::<Vec<_>>();
+
+    if let Some(exact) = available
+        .iter()
+        .copied()
+        .find(|candidate| language_identity_eq(candidate, requested))
+    {
+        return Ok(Some(exact.to_string()));
+    }
+
+    let normalized_requested = normalize_lang(requested);
+    if normalized_requested.contains('-') {
+        return Ok(None);
+    }
+
+    let mut variants = available
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            normalize_lang(candidate)
                 .split('-')
                 .next()
-                .unwrap_or(requested_lang)
+                .is_some_and(|language| language == normalized_requested.as_str())
+        })
+        .fold(Vec::<&str>::new(), |mut unique, candidate| {
+            if !unique
+                .iter()
+                .any(|existing| language_identity_eq(existing, candidate))
+            {
+                unique.push(candidate);
+            }
+            unique
+        });
+
+    match variants.len() {
+        0 => Ok(None),
+        1 => Ok(Some(variants[0].to_string())),
+        _ => {
+            variants.sort_by_key(|candidate| normalize_lang(candidate));
+            Err(format!(
+                "{} language '{}' is ambiguous; matching variants: {}. Specify {} with a fully-qualified language tag",
+                subject,
+                requested,
+                variants.join(", "),
+                option
+            ))
+        }
+    }
+}
+
+fn language_identity_eq(left: &str, right: &str) -> bool {
+    normalize_lang(left) == normalize_lang(right)
+}
+
+fn validate_unique_language_identities(codec: &Codec, label: &str) -> Result<(), String> {
+    let mut languages_by_identity = BTreeMap::<String, Vec<String>>::new();
+    for resource in &codec.resources {
+        languages_by_identity
+            .entry(normalize_lang(&resource.metadata.language))
+            .or_default()
+            .push(resource.metadata.language.clone());
+    }
+
+    let duplicates = languages_by_identity
+        .into_iter()
+        .filter_map(|(identity, mut languages)| {
+            if languages.len() < 2 {
+                return None;
+            }
+            languages.sort();
+            Some(format!("{} ({})", identity, languages.join(", ")))
+        })
+        .collect::<Vec<_>>();
+
+    if duplicates.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} contains duplicate normalized language identities: {}",
+            label,
+            duplicates.join("; ")
+        ))
+    }
+}
+
+fn find_resource_by_language_identity<'a>(
+    codec: &'a Codec,
+    language: &str,
+) -> Option<&'a Resource> {
+    codec
+        .resources
+        .iter()
+        .find(|resource| language_identity_eq(&resource.metadata.language, language))
+}
+
+fn find_entry_by_language_identity<'a>(
+    codec: &'a Codec,
+    key: &str,
+    language: &str,
+) -> Option<&'a Entry> {
+    find_resource_by_language_identity(codec, language)
+        .and_then(|resource| resource.find_entry(key))
+}
+
+fn find_entry_mut_by_language_identity<'a>(
+    codec: &'a mut Codec,
+    key: &str,
+    language: &str,
+) -> Option<&'a mut Entry> {
+    codec
+        .resources
+        .iter_mut()
+        .find(|resource| language_identity_eq(&resource.metadata.language, language))
+        .and_then(|resource| resource.find_entry_mut(key))
 }
 
 fn normalize_lang(lang: &str) -> String {
-    lang.trim().replace('_', "-").to_ascii_lowercase()
+    let normalized = lang.trim().replace('_', "-");
+    normalized
+        .parse::<unic_langid::LanguageIdentifier>()
+        .map(|language| language.to_string().to_ascii_lowercase())
+        .unwrap_or_else(|_| normalized.to_ascii_lowercase())
 }
 
 fn is_multi_language_format(format: &FormatType) -> bool {
@@ -1521,10 +1887,7 @@ fn write_back(
             let target_lang = target_lang.ok_or_else(|| {
                 "Single-language outputs require exactly one target language".to_string()
             })?;
-            let resource = codec
-                .resources
-                .iter()
-                .find(|item| lang_matches(&item.metadata.language, target_lang))
+            let resource = find_resource_by_language_identity(codec, target_lang)
                 .ok_or_else(|| format!("Target language '{}' not found in output", target_lang))?;
             Codec::write_resource_to_file(resource, output_path)
                 .map_err(|e| format!("Error writing output: {}", e))
@@ -1535,6 +1898,10 @@ fn write_back(
         }
         FormatType::Xliff(_) => Err(
             "XLIFF output is not supported by `translate` in v1. Translate into .xcstrings, .strings, or strings.xml first."
+                .to_string(),
+        ),
+        FormatType::Stringsdict(_) => Err(
+            ".stringsdict is not supported by `translate` until plural-aware translation is implemented."
                 .to_string(),
         ),
     }
@@ -1612,19 +1979,26 @@ fn parse_translation_response(text: &str) -> Result<String, String> {
     }
 
     if let Ok(payload) = serde_json::from_str::<ModelTranslationPayload>(trimmed) {
-        return Ok(payload.translation);
+        return non_blank_model_translation(payload.translation);
     }
 
     if let Some(json_body) = extract_json_body(trimmed)
         && let Ok(payload) = serde_json::from_str::<ModelTranslationPayload>(&json_body)
     {
-        return Ok(payload.translation);
+        return non_blank_model_translation(payload.translation);
     }
 
     Err(format!(
         "Model response was not valid translation JSON: {}",
         trimmed
     ))
+}
+
+fn non_blank_model_translation(translation: String) -> Result<String, String> {
+    if translation.trim().is_empty() {
+        return Err("Model returned a blank translation value".to_string());
+    }
+    Ok(translation)
 }
 
 fn extract_json_body(text: &str) -> Option<String> {
@@ -1702,6 +2076,17 @@ mod tests {
             dry_run: false,
             strict: false,
             ui_mode: UiMode::Plain,
+        }
+    }
+
+    fn test_resource(language: &str, entries: Vec<Entry>) -> Resource {
+        Resource {
+            metadata: Metadata {
+                language: language.to_string(),
+                domain: String::new(),
+                custom: HashMap::new(),
+            },
+            entries,
         }
     }
 
@@ -2008,6 +2393,115 @@ cp "{payload_path}" "$pull_path/$namespace/Localizable.xcstrings"
         assert!(err.contains("no files were written"));
         let after = fs::read_to_string(&target).unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn default_mode_rejects_missing_and_extra_placeholders_without_writing() {
+        for (case, translated_value) in [("missing", "Bienvenue"), ("extra", "Bienvenue %1$s %2$d")]
+        {
+            let temp_dir = TempDir::new().unwrap();
+            let source = temp_dir.path().join("en.strings");
+            let target = temp_dir.path().join("fr.strings");
+            fs::write(&source, "\"welcome\" = \"Welcome %1$@\";\n").unwrap();
+
+            let options = base_options(&source, Some(&target));
+            assert!(!options.strict);
+            let prepared = prepare_translation(&options).unwrap();
+            let err = run_prepared_translation(
+                prepared,
+                Some(Arc::new(MockBackend::new(vec![(
+                    ("welcome", "fr"),
+                    Ok(translated_value.to_string()),
+                )]))),
+            )
+            .unwrap_err();
+
+            assert!(
+                err.contains("no files were written"),
+                "{case}: unexpected error: {err}"
+            );
+            assert!(!target.exists(), "{case}: target must not be created");
+        }
+    }
+
+    #[test]
+    fn mock_backend_cannot_bypass_blank_translation_validation() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("en.strings");
+        let target = temp_dir.path().join("fr.strings");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+
+        let prepared = prepare_translation(&base_options(&source, Some(&target))).unwrap();
+        let err = run_prepared_translation(
+            prepared,
+            Some(Arc::new(MockBackend::new(vec![(
+                ("welcome", "fr"),
+                Ok(" \n\t ".to_string()),
+            )]))),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("no files were written"));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn valid_fully_positional_placeholder_reordering_succeeds() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("en.strings");
+        let target = temp_dir.path().join("fr.strings");
+        fs::write(
+            &source,
+            "\"message\" = \"Hello %1$@, you have %2$d items\";\n",
+        )
+        .unwrap();
+
+        let prepared = prepare_translation(&base_options(&source, Some(&target))).unwrap();
+        let outcome = run_prepared_translation(
+            prepared,
+            Some(Arc::new(MockBackend::new(vec![(
+                ("message", "fr"),
+                Ok("Vous avez %2$d elements, %1$s".to_string()),
+            )]))),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.translated, 1);
+        let written = fs::read_to_string(target).unwrap();
+        assert!(written.contains("\"message\" = \"Vous avez %2$d elements, %1$@\";"));
+    }
+
+    #[test]
+    fn strict_mode_ignores_unrelated_preexisting_placeholder_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("en.strings");
+        let target = temp_dir.path().join("fr.strings");
+        fs::write(
+            &source,
+            "\"welcome\" = \"Welcome %1$@\";\n\"legacy\" = \"Legacy %@\";\n",
+        )
+        .unwrap();
+        fs::write(&target, "\"legacy\" = \"Heritage %d\";\n").unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.strict = true;
+        let prepared = prepare_translation(&options).unwrap();
+        assert_eq!(prepared.jobs.len(), 1);
+        assert_eq!(prepared.jobs[0].key, "welcome");
+
+        let outcome = run_prepared_translation(
+            prepared,
+            Some(Arc::new(MockBackend::new(vec![(
+                ("welcome", "fr"),
+                Ok("Bienvenue %1$s".to_string()),
+            )]))),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.translated, 1);
+        let written = fs::read_to_string(target).unwrap();
+        assert!(written.contains("\"welcome\" = \"Bienvenue %1$@\";"));
+        assert!(written.contains("\"legacy\" = \"Heritage %d\";"));
     }
 
     #[test]
@@ -2505,7 +2999,7 @@ target = "translated.xcstrings"
     }
 
     #[test]
-    fn canonicalizes_target_language_from_existing_target_resource() {
+    fn bare_target_language_resolves_sole_variant() {
         let temp_dir = TempDir::new().unwrap();
         let source = temp_dir.path().join("translations.csv");
         let target = temp_dir.path().join("target.csv");
@@ -2519,6 +3013,619 @@ target = "translated.xcstrings"
         let prepared = prepare_translation(&options).unwrap();
         assert_eq!(prepared.opts.target_langs, vec!["fr-CA".to_string()]);
         assert_eq!(prepared.summary.queued, 1);
+    }
+
+    #[test]
+    fn exact_target_language_wins_over_same_base_variant() {
+        let mut codec = Codec::new();
+        codec.add_resource(test_resource("pt-BR", Vec::new()));
+        codec.add_resource(test_resource("pt-PT", Vec::new()));
+
+        let resolved =
+            resolve_target_languages(&codec, &["pt-PT".to_string()], None, None).unwrap();
+
+        assert_eq!(resolved, vec!["pt-PT".to_string()]);
+    }
+
+    #[test]
+    fn bare_target_language_reports_ambiguous_variants() {
+        let mut codec = Codec::new();
+        codec.add_resource(test_resource("fr-FR", Vec::new()));
+        codec.add_resource(test_resource("fr-CA", Vec::new()));
+
+        let err = resolve_target_languages(&codec, &["fr".to_string()], None, None).unwrap_err();
+
+        assert!(err.contains("Target language 'fr' is ambiguous"));
+        assert!(err.contains("fr-FR"));
+        assert!(err.contains("fr-CA"));
+        assert!(err.contains("--target-lang"));
+    }
+
+    #[test]
+    fn bare_source_language_reports_ambiguous_variants() {
+        let mut codec = Codec::new();
+        codec.add_resource(test_resource("fr-FR", Vec::new()));
+        codec.add_resource(test_resource("fr-CA", Vec::new()));
+
+        let err = select_source_resource(&codec, &Some("fr".to_string())).unwrap_err();
+
+        assert!(err.contains("Source language 'fr' is ambiguous"));
+        assert!(err.contains("fr-FR"));
+        assert!(err.contains("fr-CA"));
+        assert!(err.contains("--source-lang"));
+    }
+
+    #[test]
+    fn fully_qualified_source_does_not_bind_different_variant() {
+        let mut codec = Codec::new();
+        codec.add_resource(test_resource("pt-BR", Vec::new()));
+
+        let err = select_source_resource(&codec, &Some("pt-PT".to_string())).unwrap_err();
+
+        assert_eq!(err, "Source language 'pt-PT' not found");
+    }
+
+    #[test]
+    fn source_lang_does_not_retag_path_qualified_source_or_write_target() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("pt-BR.lproj");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("Localizable.strings");
+        let target = temp_dir.path().join("fr.strings");
+        fs::write(&source, "\"welcome\" = \"Bem-vindo\";\n").unwrap();
+        fs::write(&target, "\"existing\" = \"Conserver\";\n").unwrap();
+        let target_before = fs::read_to_string(&target).unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.source_lang = Some("pt-PT".to_string());
+
+        let err = prepare_translation(&options).unwrap_err();
+
+        assert_eq!(err, "Source language 'pt-PT' not found");
+        assert_eq!(fs::read_to_string(target).unwrap(), target_before);
+    }
+
+    #[test]
+    fn bare_source_lang_preserves_path_qualified_source_identity() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("fr-CA.lproj");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("Localizable.strings");
+        let target = temp_dir.path().join("de.strings");
+        fs::write(&source, "\"welcome\" = \"Bienvenue\";\n").unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.source_lang = Some("fr".to_string());
+        options.target_langs = vec!["de".to_string()];
+
+        let prepared = prepare_translation(&options).unwrap();
+
+        assert_eq!(prepared.source_resource.language, "fr-CA");
+        assert_eq!(prepared.jobs[0].source_lang, "fr-CA");
+    }
+
+    #[test]
+    fn identityless_single_language_source_uses_source_lang_as_read_hint() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("Localizable.strings");
+        let target = temp_dir.path().join("fr.strings");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.strict = true;
+
+        let prepared = prepare_translation(&options).unwrap();
+
+        assert_eq!(prepared.source_resource.language, "en");
+        assert_eq!(prepared.summary.queued, 1);
+    }
+
+    #[test]
+    fn standalone_strings_header_identity_is_preserved_in_strict_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("Catalog.strings");
+        let target = temp_dir.path().join("de.strings");
+        fs::write(
+            &source,
+            "//: Language: fr-CA\n\"welcome\" = \"Bienvenue\";\n",
+        )
+        .unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.source_lang = Some("fr".to_string());
+        options.target_langs = vec!["de".to_string()];
+        options.strict = true;
+
+        let prepared = prepare_translation(&options).unwrap();
+
+        assert_eq!(prepared.source_resource.language, "fr-CA");
+        assert_eq!(prepared.jobs[0].source_lang, "fr-CA");
+    }
+
+    #[test]
+    fn source_lang_selects_without_retagging_intrinsic_xcstrings_locale() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("Catalog.xcstrings");
+        let target = temp_dir.path().join("de.strings");
+        fs::write(
+            &source,
+            r#"{
+  "sourceLanguage" : "fr-CA",
+  "version" : "1.0",
+  "strings" : {
+    "welcome" : {
+      "localizations" : {
+        "fr-CA" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bienvenue"
+          }
+        }
+      }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.source_lang = Some("fr".to_string());
+        options.target_langs = vec!["de".to_string()];
+
+        let prepared = prepare_translation(&options).unwrap();
+
+        assert_eq!(prepared.source_resource.language, "fr-CA");
+        assert_eq!(prepared.jobs[0].source_lang, "fr-CA");
+    }
+
+    #[test]
+    fn script_variants_are_distinct_source_and_target_languages() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("translations.csv");
+        fs::write(&source, "key,zh-Hans,zh-Hant\nwelcome,欢迎,\n").unwrap();
+
+        let mut options = base_options(&source, None);
+        options.source_lang = Some("zh-Hans".to_string());
+        options.target_langs = vec!["zh-Hant".to_string()];
+
+        let prepared = prepare_translation(&options).unwrap();
+
+        assert_eq!(prepared.source_resource.language, "zh-Hans");
+        assert_eq!(prepared.opts.target_langs, vec!["zh-Hant".to_string()]);
+        assert_eq!(prepared.summary.queued, 1);
+    }
+
+    #[test]
+    fn existing_target_lookup_uses_normalized_full_tag_identity() {
+        let source = test_resource(
+            "en",
+            vec![Entry {
+                id: "welcome".to_string(),
+                value: Translation::Singular("Welcome".to_string()),
+                comment: None,
+                status: EntryStatus::Translated,
+                custom: HashMap::new(),
+            }],
+        );
+        let mut target_codec = Codec::new();
+        target_codec.add_resource(test_resource(
+            "fr_CA",
+            vec![Entry {
+                id: "welcome".to_string(),
+                value: Translation::Singular("Bienvenue".to_string()),
+                comment: None,
+                status: EntryStatus::Translated,
+                custom: HashMap::new(),
+            }],
+        ));
+
+        let (jobs, summary) = build_jobs(
+            &source,
+            &target_codec,
+            &["FR-ca".to_string()],
+            &[EntryStatus::New, EntryStatus::Stale],
+            false,
+        )
+        .unwrap();
+
+        assert!(jobs.is_empty());
+        assert_eq!(summary.skipped_status, 1);
+    }
+
+    #[test]
+    fn prepare_rejects_duplicate_normalized_target_identities() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("source.csv");
+        let target = temp_dir.path().join("target.csv");
+        fs::write(&source, "key,en\nwelcome,Welcome\n").unwrap();
+        fs::write(&target, "key,fr_CA,fr-CA\nwelcome,,\n").unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.target_langs = vec!["fr-CA".to_string()];
+
+        let err = prepare_translation(&options).unwrap_err();
+
+        assert_eq!(
+            err,
+            "Target catalog contains duplicate normalized language identities: fr-ca (fr-CA, fr_CA)"
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_duplicate_normalized_source_identities() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("source.csv");
+        fs::write(&source, "key,fr_CA,fr-CA\nwelcome,Bienvenue,Salut\n").unwrap();
+
+        let mut options = base_options(&source, None);
+        options.source_lang = Some("fr-CA".to_string());
+        options.target_langs = vec!["de".to_string()];
+
+        let err = prepare_translation(&options).unwrap_err();
+
+        assert_eq!(
+            err,
+            "Source catalog contains duplicate normalized language identities: fr-ca (fr-CA, fr_CA)"
+        );
+    }
+
+    #[test]
+    fn output_only_single_language_starts_with_empty_target() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("en.lproj");
+        let output_dir = temp_dir.path().join("fr.lproj");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("Localizable.strings");
+        let output = output_dir.join("Localizable.strings");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+
+        let mut options = base_options(&source, None);
+        options.output = Some(output.to_string_lossy().to_string());
+
+        let prepared = prepare_translation(&options).unwrap();
+
+        assert_eq!(prepared.target_path, output.to_string_lossy().to_string());
+        assert_eq!(prepared.opts.target_langs, vec!["fr".to_string()]);
+        assert_eq!(prepared.summary.queued, 1);
+        assert!(prepared.target_codec.find_entry("welcome", "fr").is_none());
+    }
+
+    #[test]
+    fn output_only_multilanguage_preserves_source_resource() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("en.strings");
+        let output = temp_dir.path().join("translations.csv");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+
+        let mut options = base_options(&source, None);
+        options.output = Some(output.to_string_lossy().to_string());
+
+        let prepared = prepare_translation(&options).unwrap();
+
+        assert_eq!(prepared.summary.queued, 1);
+        assert_eq!(
+            prepared
+                .target_codec
+                .find_entry("welcome", "en")
+                .map(|entry| &entry.value),
+            Some(&Translation::Singular("Welcome".to_string()))
+        );
+    }
+
+    #[test]
+    fn distinct_target_infers_language_from_target_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("en.lproj");
+        let target_dir = temp_dir.path().join("fr-CA.lproj");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        let source = source_dir.join("Localizable.strings");
+        let target = target_dir.join("Localizable.strings");
+        let output = temp_dir.path().join("translated.xcstrings");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+        fs::write(&target, "\"welcome\" = \"\";\n").unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.target_langs = vec!["fr".to_string()];
+        options.output = Some(output.to_string_lossy().to_string());
+
+        let prepared = prepare_translation(&options).unwrap();
+
+        assert_eq!(prepared.opts.target_langs, vec!["fr-CA".to_string()]);
+        assert_eq!(prepared.summary.queued, 1);
+        assert!(prepared.target_codec.get_by_language("fr-CA").is_some());
+    }
+
+    #[test]
+    fn identityless_existing_target_uses_separate_output_locale_and_preserves_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("en.lproj");
+        let output_dir = temp_dir.path().join("fr-CA.lproj");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&output_dir).unwrap();
+        let source = source_dir.join("Localizable.strings");
+        let target = temp_dir.path().join("Existing.strings");
+        let output = output_dir.join("Localizable.strings");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+        fs::write(
+            &target,
+            "\"welcome\" = \"\";\n\"target_only\" = \"Conserver\";\n",
+        )
+        .unwrap();
+        let target_before = fs::read_to_string(&target).unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.output = Some(output.to_string_lossy().to_string());
+        options.strict = true;
+
+        let prepared = prepare_translation(&options).unwrap();
+        assert_eq!(prepared.opts.target_langs, vec!["fr-CA".to_string()]);
+        assert!(
+            prepared
+                .target_codec
+                .find_entry("target_only", "fr-CA")
+                .is_some()
+        );
+
+        let outcome = run_prepared_translation(
+            prepared,
+            Some(Arc::new(MockBackend::new(vec![(
+                ("welcome", "fr-CA"),
+                Ok("Bienvenue".to_string()),
+            )]))),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.translated, 1);
+        let written = fs::read_to_string(output).unwrap();
+        assert!(written.contains("\"welcome\" = \"Bienvenue\";"));
+        assert!(written.contains("\"target_only\" = \"Conserver\";"));
+        assert_eq!(fs::read_to_string(target).unwrap(), target_before);
+    }
+
+    #[test]
+    fn strict_mode_binds_identityless_existing_target_from_sole_requested_locale() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("en.lproj");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("Localizable.strings");
+        let target = temp_dir.path().join("Existing.strings");
+        let output = temp_dir.path().join("translated.xcstrings");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+        fs::write(&target, "\"target_only\" = \"Conserver\";\n").unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.target_langs = vec!["fr-CA".to_string()];
+        options.output = Some(output.to_string_lossy().to_string());
+        options.strict = true;
+
+        let prepared = prepare_translation(&options).unwrap();
+
+        assert_eq!(prepared.opts.target_langs, vec!["fr-CA".to_string()]);
+        assert!(
+            prepared
+                .target_codec
+                .find_entry("target_only", "fr-CA")
+                .is_some()
+        );
+        assert_eq!(prepared.summary.queued, 1);
+    }
+
+    #[test]
+    fn identityless_existing_target_rejects_multiple_requested_locales_as_ambiguous() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("en.lproj");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("Localizable.strings");
+        let target = temp_dir.path().join("Existing.strings");
+        let output = temp_dir.path().join("translated.xcstrings");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+        fs::write(&target, "\"target_only\" = \"Conserver\";\n").unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.target_langs = vec!["fr".to_string(), "de".to_string()];
+        options.output = Some(output.to_string_lossy().to_string());
+        options.strict = true;
+
+        let err = prepare_translation(&options).unwrap_err();
+
+        assert!(err.contains("has no locale identity"));
+        assert!(err.contains("cannot be assigned unambiguously"));
+        assert!(err.contains("[fr, de]"));
+        assert!(err.contains("exactly one --target-lang"));
+    }
+
+    #[test]
+    fn missing_target_path_language_is_authoritative_for_multilanguage_output() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("en.lproj");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("Localizable.strings");
+        let target = temp_dir
+            .path()
+            .join("fr-CA.lproj")
+            .join("Localizable.strings");
+        let output = temp_dir.path().join("translated.xcstrings");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.target_langs = vec!["fr".to_string()];
+        options.output = Some(output.to_string_lossy().to_string());
+
+        let prepared = prepare_translation(&options).unwrap();
+
+        assert_eq!(prepared.opts.target_langs, vec!["fr-CA".to_string()]);
+        assert_eq!(prepared.summary.queued, 1);
+        assert!(prepared.target_codec.get_by_language("en").is_some());
+        assert!(prepared.target_codec.get_by_language("fr-CA").is_some());
+        assert!(prepared.target_codec.get_by_language("fr").is_none());
+    }
+
+    #[test]
+    fn missing_same_base_target_hint_precedes_source_seed() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("en-US.lproj");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("Localizable.strings");
+        let target = temp_dir
+            .path()
+            .join("en-GB.lproj")
+            .join("Localizable.strings");
+        let output = temp_dir.path().join("translated.xcstrings");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.source_lang = Some("en-US".to_string());
+        options.target_langs = vec!["en".to_string()];
+        options.output = Some(output.to_string_lossy().to_string());
+
+        let prepared = prepare_translation(&options).unwrap();
+
+        assert_eq!(prepared.source_resource.language, "en-US");
+        assert_eq!(prepared.opts.target_langs, vec!["en-GB".to_string()]);
+        assert_eq!(prepared.summary.queued, 1);
+        assert!(prepared.target_codec.get_by_language("en-US").is_some());
+        assert!(prepared.target_codec.get_by_language("en-GB").is_some());
+    }
+
+    #[test]
+    fn rejects_qualified_target_conflicting_with_explicit_target_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("en.lproj");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("Localizable.strings");
+        let target = temp_dir
+            .path()
+            .join("fr-CA.lproj")
+            .join("Localizable.strings");
+        let output = temp_dir.path().join("translated.xcstrings");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.target_langs = vec!["fr-FR".to_string()];
+        options.output = Some(output.to_string_lossy().to_string());
+
+        let err = prepare_translation(&options).unwrap_err();
+
+        assert!(err.contains("Requested target language 'fr-FR'"));
+        assert!(err.contains("explicit target path language 'fr-CA'"));
+        assert!(err.contains("refusing to retag"));
+    }
+
+    #[test]
+    fn explicit_target_hint_does_not_block_unrelated_multilanguage_targets() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("en.lproj");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("Localizable.strings");
+        let target = temp_dir
+            .path()
+            .join("fr-CA.lproj")
+            .join("Localizable.strings");
+        let output = temp_dir.path().join("translated.xcstrings");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.target_langs = vec!["fr-CA".to_string(), "de-DE".to_string()];
+        options.output = Some(output.to_string_lossy().to_string());
+
+        let prepared = prepare_translation(&options).unwrap();
+
+        assert_eq!(
+            prepared.opts.target_langs,
+            vec!["fr-CA".to_string(), "de-DE".to_string()]
+        );
+        assert_eq!(prepared.summary.queued, 2);
+        assert!(prepared.target_codec.get_by_language("fr-CA").is_some());
+        assert!(prepared.target_codec.get_by_language("de-DE").is_some());
+    }
+
+    #[test]
+    fn explicit_script_target_hint_allows_sibling_variant_target() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("en.lproj");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("Localizable.strings");
+        let target = temp_dir
+            .path()
+            .join("zh-Hans.lproj")
+            .join("Localizable.strings");
+        let output = temp_dir.path().join("translated.xcstrings");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.target_langs = vec!["zh-Hans".to_string(), "zh-Hant".to_string()];
+        options.output = Some(output.to_string_lossy().to_string());
+
+        let prepared = prepare_translation(&options).unwrap();
+
+        assert_eq!(
+            prepared.opts.target_langs,
+            vec!["zh-Hans".to_string(), "zh-Hant".to_string()]
+        );
+        assert_eq!(prepared.summary.queued, 2);
+        assert!(prepared.target_codec.get_by_language("zh-Hans").is_some());
+        assert!(prepared.target_codec.get_by_language("zh-Hant").is_some());
+    }
+
+    #[test]
+    fn explicit_target_path_binding_is_order_independent() {
+        let resolved = resolve_target_languages(
+            &Codec::new(),
+            &["zh-Hant".to_string(), "zh-Hans".to_string()],
+            Some("zh-Hans"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, vec!["zh-Hant".to_string(), "zh-Hans".to_string()]);
+    }
+
+    #[test]
+    fn rejects_incompatible_qualified_target_and_output_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("en.lproj");
+        let target_dir = temp_dir.path().join("pt-BR.lproj");
+        let output_dir = temp_dir.path().join("pt-PT.lproj");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        let source = source_dir.join("Localizable.strings");
+        let target = target_dir.join("Localizable.strings");
+        let output = output_dir.join("Localizable.strings");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+        fs::write(&target, "\"welcome\" = \"Bem-vindo\";\n").unwrap();
+
+        let mut options = base_options(&source, Some(&target));
+        options.target_langs = vec!["pt-PT".to_string()];
+        options.output = Some(output.to_string_lossy().to_string());
+
+        let err = prepare_translation(&options).unwrap_err();
+
+        assert!(err.contains("Target path"));
+        assert!(err.contains("pt-BR"));
+        assert!(err.contains("pt-PT"));
+        assert!(err.contains("refusing to retag"));
+    }
+
+    #[test]
+    fn rejects_target_language_incompatible_with_single_language_output_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("en.lproj");
+        let output_dir = temp_dir.path().join("pt-PT.lproj");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("Localizable.strings");
+        let output = output_dir.join("Localizable.strings");
+        fs::write(&source, "\"welcome\" = \"Welcome\";\n").unwrap();
+
+        let mut options = base_options(&source, None);
+        options.target_langs = vec!["pt-BR".to_string()];
+        options.output = Some(output.to_string_lossy().to_string());
+
+        let err = prepare_translation(&options).unwrap_err();
+
+        assert!(err.contains("Target language 'pt-BR'"));
+        assert!(err.contains("pt-PT"));
+        assert!(err.contains("matching output locale"));
     }
 
     #[test]
@@ -2543,6 +3650,17 @@ target = "translated.xcstrings"
         let text = "```json\n{\"translation\":\"Bonjour\"}\n```";
         let parsed = parse_translation_response(text).unwrap();
         assert_eq!(parsed, "Bonjour");
+    }
+
+    #[test]
+    fn rejects_blank_translation_values_in_direct_and_fenced_json() {
+        for response in [
+            r#"{"translation":" \n\t "}"#,
+            "```json\n{\"translation\":\"   \"}\n```",
+        ] {
+            let err = parse_translation_response(response).unwrap_err();
+            assert!(err.contains("blank translation value"));
+        }
     }
 
     #[test]

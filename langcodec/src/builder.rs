@@ -60,9 +60,13 @@ impl CodecBuilder {
             .unwrap_or_default()
             .to_string();
 
+        let mut preserve_parsed_metadata = false;
         let mut new_resources = match &format_type {
             FormatType::Strings(_) => {
                 vec![Resource::from(StringsFormat::read_from(path)?)]
+            }
+            FormatType::Stringsdict(_) => {
+                vec![Resource::from(StringsdictFormat::read_from(path)?)]
             }
             FormatType::AndroidStrings(_) => {
                 vec![Resource::from(AndroidStringsFormat::read_from(path)?)]
@@ -72,29 +76,33 @@ impl CodecBuilder {
             FormatType::CSV => {
                 // Parse CSV format and convert to resources
                 let csv_format = CSVFormat::read_from(path)?;
+                preserve_parsed_metadata = csv_format.is_extended();
                 Vec::<Resource>::try_from(csv_format)?
             }
             FormatType::TSV => {
                 // Parse TSV format and convert to resources
                 let tsv_format = TSVFormat::read_from(path)?;
+                preserve_parsed_metadata = tsv_format.is_extended();
                 Vec::<Resource>::try_from(tsv_format)?
             }
         };
 
         let should_override_language = matches!(
             format_type,
-            FormatType::Strings(_) | FormatType::AndroidStrings(_)
+            FormatType::Strings(_) | FormatType::Stringsdict(_) | FormatType::AndroidStrings(_)
         );
 
         for new_resource in &mut new_resources {
             if should_override_language && let Some(ref lang) = language {
                 new_resource.metadata.language = lang.clone();
             }
-            new_resource.metadata.domain = domain.clone();
-            new_resource
-                .metadata
-                .custom
-                .insert("format".to_string(), format_type.to_string());
+            if !preserve_parsed_metadata {
+                new_resource.metadata.domain = domain.clone();
+                new_resource
+                    .metadata
+                    .custom
+                    .insert("format".to_string(), format_type.to_string());
+            }
         }
 
         self.resources.extend(new_resources);
@@ -132,9 +140,13 @@ impl CodecBuilder {
             .to_string();
         let path = path.as_ref();
 
+        let mut preserve_parsed_metadata = false;
         let mut new_resources = match &format_type {
             FormatType::Strings(_) => {
                 vec![Resource::from(StringsFormat::read_from(path)?)]
+            }
+            FormatType::Stringsdict(_) => {
+                vec![Resource::from(StringsdictFormat::read_from(path)?)]
             }
             FormatType::AndroidStrings(_) => {
                 vec![Resource::from(AndroidStringsFormat::read_from(path)?)]
@@ -144,29 +156,33 @@ impl CodecBuilder {
             FormatType::CSV => {
                 // Parse CSV format and convert to resources
                 let csv_format = CSVFormat::read_from(path)?;
+                preserve_parsed_metadata = csv_format.is_extended();
                 Vec::<Resource>::try_from(csv_format)?
             }
             FormatType::TSV => {
                 // Parse TSV format and convert to resources
                 let tsv_format = TSVFormat::read_from(path)?;
+                preserve_parsed_metadata = tsv_format.is_extended();
                 Vec::<Resource>::try_from(tsv_format)?
             }
         };
 
         let should_override_language = matches!(
             format_type,
-            FormatType::Strings(_) | FormatType::AndroidStrings(_)
+            FormatType::Strings(_) | FormatType::Stringsdict(_) | FormatType::AndroidStrings(_)
         );
 
         for new_resource in &mut new_resources {
             if should_override_language && let Some(ref lang) = language {
                 new_resource.metadata.language = lang.clone();
             }
-            new_resource.metadata.domain = domain.clone();
-            new_resource
-                .metadata
-                .custom
-                .insert("format".to_string(), format_type.to_string());
+            if !preserve_parsed_metadata {
+                new_resource.metadata.domain = domain.clone();
+                new_resource
+                    .metadata
+                    .custom
+                    .insert("format".to_string(), format_type.to_string());
+            }
         }
 
         self.resources.extend(new_resources);
@@ -194,6 +210,7 @@ impl CodecBuilder {
         let format_type = match path.as_ref().extension().and_then(|s| s.to_str()) {
             Some("xml") => FormatType::AndroidStrings(lang),
             Some("strings") => FormatType::Strings(lang),
+            Some("stringsdict") => FormatType::Stringsdict(lang),
             Some("xcstrings") => FormatType::Xcstrings,
             Some("xliff") => FormatType::Xliff(lang),
             Some("csv") => FormatType::CSV,

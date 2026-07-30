@@ -143,14 +143,14 @@ impl Resource {
     }
 
     pub fn parse_language_identifier(&self) -> Option<LanguageIdentifier> {
-        self.metadata.language.parse().ok()
+        self.metadata.language.replace('_', "-").parse().ok()
     }
 
     /// Check if this resource has a specific language.
     pub fn has_language(&self, lang: &str) -> bool {
         match (
             self.parse_language_identifier(),
-            lang.parse::<LanguageIdentifier>(),
+            lang.replace('_', "-").parse::<LanguageIdentifier>(),
         ) {
             (Some(lang_id), Ok(target_lang)) => lang_id.language == target_lang.language,
             _ => false,
@@ -455,6 +455,24 @@ mod tests {
         let lang_id = resource.parse_language_identifier().unwrap();
         assert_eq!(lang_id.language.as_str(), "en");
         assert_eq!(lang_id.region.unwrap().as_str(), "US");
+    }
+
+    #[test]
+    fn resource_language_identifier_normalizes_underscore_and_case() {
+        let resource = Resource {
+            metadata: Metadata {
+                language: "PT_br".to_string(),
+                domain: "test".to_string(),
+                custom: HashMap::new(),
+            },
+            entries: Vec::new(),
+        };
+
+        assert_eq!(
+            resource.parse_language_identifier().unwrap().to_string(),
+            "pt-BR"
+        );
+        assert!(resource.has_language("pt_BR"));
     }
 
     #[test]

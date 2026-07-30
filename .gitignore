@@ -11,5 +11,6 @@ docs/plans/*
 # Agentic assets
 .nodus
 nodus.lock
+.fuli/
 
 opencode.json

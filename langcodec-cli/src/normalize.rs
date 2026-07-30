@@ -38,6 +38,13 @@ fn infer_output_format_from_path(path: &str) -> Result<FormatType, String> {
 }
 
 fn reject_xliff_normalize_paths(input: &str, output: Option<&String>) -> Result<(), String> {
+    if input.ends_with(".stringsdict") || output.is_some_and(|path| path.ends_with(".stringsdict"))
+    {
+        return Err(
+            ".stringsdict is not supported by `normalize`: placeholder or key rewriting can invalidate plural selector metadata. Use `convert`, `view`, or `check` instead."
+                .to_string(),
+        );
+    }
     if input.ends_with(".xliff") || output.is_some_and(|path| path.ends_with(".xliff")) {
         return Err(
             ".xliff is not supported by `normalize` in v1. Use `convert`, `view`, or `debug` instead."
@@ -69,6 +76,10 @@ fn write_back(codec: &Codec, input_path: &str, output_path: &Option<String>) -> 
             Codec::write_resource_to_file(resource, out)
                 .map_err(|e| format!("Error writing output: {}", e))
         }
+        FormatType::Stringsdict(_) => Err(
+            ".stringsdict is not supported by `normalize`. Use `convert`, `view`, or `check` instead."
+                .to_string(),
+        ),
         FormatType::Xcstrings | FormatType::CSV | FormatType::TSV => {
             langcodec::converter::convert_resources_to_format(codec.resources.clone(), out, fmt)
                 .map_err(|e| format!("Error writing output: {}", e))

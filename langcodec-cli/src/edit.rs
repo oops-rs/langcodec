@@ -23,7 +23,7 @@ fn infer_output_format_from_path(path: &str) -> Result<FormatType, String> {
         .ok_or_else(|| format!("Cannot infer format from path: {}", path))
 }
 
-fn reject_xliff_paths(input_path: &str, output_path: Option<&String>) -> Result<(), String> {
+fn reject_unsafe_edit_paths(input_path: &str, output_path: Option<&String>) -> Result<(), String> {
     if input_path.ends_with(".xliff") {
         return Err(
             ".xliff is not supported by `edit` in v1. Use `convert`, `view`, or `debug` instead."
@@ -33,6 +33,14 @@ fn reject_xliff_paths(input_path: &str, output_path: Option<&String>) -> Result<
     if output_path.is_some_and(|path| path.ends_with(".xliff")) {
         return Err(
             ".xliff is not supported as an `edit` output in v1. Use `convert` instead.".to_string(),
+        );
+    }
+    if input_path.ends_with(".stringsdict")
+        || output_path.is_some_and(|path| path.ends_with(".stringsdict"))
+    {
+        return Err(
+            ".stringsdict is not supported by `edit set`: singular updates and removals are not representable in this plural-only format."
+                .to_string(),
         );
     }
     Ok(())
@@ -93,6 +101,10 @@ fn write_back(
         }
         FormatType::Xliff(_) => Err(
             ".xliff is not supported as an `edit` output in v1. Use `convert` instead.".to_string(),
+        ),
+        FormatType::Stringsdict(_) => Err(
+            ".stringsdict is not supported by `edit set`: singular updates and removals are not representable in this plural-only format."
+                .to_string(),
         ),
     }
 }
@@ -242,7 +254,7 @@ fn apply_set_to_file(
     output: Option<&String>,
     dry_run: bool,
 ) -> Result<(), String> {
-    reject_xliff_paths(input, output)?;
+    reject_unsafe_edit_paths(input, output)?;
 
     let mut codec = Codec::new();
     if let Err(e) = codec.read_file_by_extension(input, lang.clone()) {

@@ -1,5 +1,6 @@
 mod ai;
 mod annotate;
+mod check;
 mod config;
 mod convert;
 mod debug;
@@ -21,11 +22,12 @@ mod validation;
 mod view;
 
 use crate::annotate::{AnnotateOptions, run_annotate_command};
+use crate::check::{CheckOptions, run_check_command};
 use crate::convert::{ConvertOptions, run_unified_convert_command, try_custom_format_view};
-use crate::editor::{BrowseOptions, run_browse_command};
 use crate::debug::run_debug_command;
 use crate::diff::{DiffOptions, run_diff_command};
 use crate::edit::{EditSetOptions, run_edit_set_command};
+use crate::editor::{BrowseOptions, run_browse_command};
 use crate::merge::{ConflictStrategy, run_merge_command};
 use crate::normalize::{NormalizeCliOptions, run_normalize_command};
 use crate::sync::{SyncOptions, run_sync_command};
@@ -74,13 +76,13 @@ enum Commands {
         /// Optional output format hint (e.g., "xcstrings", "xliff", "strings", "android")
         #[arg(long)]
         output_format: Option<String>,
-        /// For xcstrings or xliff output: override source language (default: inferred or en for xcstrings)
+        /// Input language hint for .strings, .stringsdict, or Android XML; also overrides source metadata/selection for xcstrings or XLIFF output
         #[arg(long)]
         source_language: Option<String>,
         /// For xcstrings output: override version (default: 1.0)
         #[arg(long)]
         version: Option<String>,
-        /// Select the output language for `.strings`, `strings.xml`, or `.xliff` output
+        /// Select the output language for `.strings`, `.stringsdict`, `strings.xml`, or `.xliff` output
         #[arg(long, value_name = "LANG")]
         output_lang: Option<String>,
         /// Language codes to exclude from output (e.g., "en", "fr"). Can be specified multiple times or as comma-separated values (e.g., "--exclude-lang en,fr,zh-hans"). Only affects .langcodec output format.
@@ -208,7 +210,7 @@ enum Commands {
     /// input formats and converting to the output format based on the file extension.
     /// Supports merging files with the same language and provides conflict resolution strategies.
     Merge {
-        /// The input files to merge (supports multiple formats: .strings, .xml, .csv, .tsv, .xcstrings, .json, .yaml)
+        /// The input files to merge (supports multiple formats: .strings, .stringsdict, .xml, .csv, .tsv, .xcstrings, .json, .yaml)
         #[arg(short, long, num_args = 1.., help = "Input files. Supports glob patterns. Quote patterns to avoid slow shell-side expansion (e.g., '/path/**/*/strings.xml').")]
         inputs: Vec<String>,
         /// The output file path (format automatically determined from extension)
@@ -255,6 +257,25 @@ enum Commands {
         key_style: String,
 
         /// Continue processing remaining files when a file fails
+        #[arg(long, default_value_t = false)]
+        continue_on_error: bool,
+    },
+
+    /// Validate localization files for CI without modifying them.
+    Check {
+        /// The input files to validate (supports glob patterns). Quote patterns to avoid shell expansion.
+        #[arg(short, long, required = true, num_args = 1.., help = "Input files. Supports glob patterns. Quote patterns to avoid slow shell-side expansion (e.g., '/path/**/*/Localizable.strings').")]
+        inputs: Vec<String>,
+
+        /// Language hint for single-language formats such as .strings, .stringsdict, and strings.xml
+        #[arg(short, long)]
+        lang: Option<String>,
+
+        /// Output one machine-readable JSON document
+        #[arg(long, default_value_t = false)]
+        json: bool,
+
+        /// Continue inspecting remaining files after an issue is found
         #[arg(long, default_value_t = false)]
         continue_on_error: bool,
     },
@@ -1151,6 +1172,23 @@ fn main() {
                     "{}",
                     ui::status_line_stderr(ui::Tone::Error, &format!("Normalize failed: {}", e),)
                 );
+                std::process::exit(1);
+            }
+        }
+        Commands::Check {
+            inputs,
+            lang,
+            json,
+            continue_on_error,
+        } => {
+            let valid = run_check_command(CheckOptions {
+                inputs,
+                lang,
+                json,
+                continue_on_error,
+                strict,
+            });
+            if !valid {
                 std::process::exit(1);
             }
         }

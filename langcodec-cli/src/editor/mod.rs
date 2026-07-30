@@ -13,7 +13,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use langcodec::Codec;
+use langcodec::{Codec, FormatType};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use self::{
@@ -39,8 +39,8 @@ impl TermGuard {
         execute!(out, EnterAlternateScreen, EnableBracketedPaste)
             .map_err(|e| format!("Failed to enter alternate screen: {e}"))?;
         let backend = CrosstermBackend::new(out);
-        let terminal = Terminal::new(backend)
-            .map_err(|e| format!("Failed to create terminal: {e}"))?;
+        let terminal =
+            Terminal::new(backend).map_err(|e| format!("Failed to create terminal: {e}"))?;
         Ok(Self { terminal })
     }
 }
@@ -63,6 +63,12 @@ pub fn run_browse_command(opts: BrowseOptions) -> Result<(), String> {
     // Infer format from extension so we can write back in the same format
     let inferred_format = langcodec::infer_format_from_path(&file_path)
         .ok_or_else(|| format!("Cannot detect format for '{file_path}'"))?;
+    if matches!(inferred_format, FormatType::Stringsdict(_)) {
+        return Err(
+            ".stringsdict is read-only in `view`, `debug`, and `check`; `browse` editing is not supported because scalar edits cannot preserve plural forms."
+                .to_string(),
+        );
+    }
 
     // Load the file
     let mut codec = Codec::new();
@@ -92,9 +98,7 @@ pub fn run_browse_command(opts: BrowseOptions) -> Result<(), String> {
             .draw(|frame| ui::render(frame, &mut app))
             .map_err(|e| format!("Render error: {e}"))?;
 
-        if poll(Duration::from_millis(50))
-            .map_err(|e| format!("Input poll error: {e}"))?
-        {
+        if poll(Duration::from_millis(50)).map_err(|e| format!("Input poll error: {e}"))? {
             let event = read().map_err(|e| format!("Input read error: {e}"))?;
             if let HandlerResult::Quit = handle_event(&mut app, event) {
                 break;

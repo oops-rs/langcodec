@@ -1,9 +1,6 @@
 use std::collections::HashSet;
 
-use langcodec::{
-    Codec, FormatType, Resource, Translation,
-    types::EntryStatus,
-};
+use langcodec::{Codec, FormatType, Resource, Translation, types::EntryStatus};
 use ratatui::widgets::ListState;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -250,16 +247,24 @@ impl App {
             let value = self.edit_buffer.clone();
             let translation = Translation::Singular(value);
             let result = if self.codec.has_entry(&key, &lang) {
-                self.codec.update_translation(&key, &lang, translation, None)
-            } else {
                 self.codec
-                    .add_entry(&key, &lang, translation, None, Some(EntryStatus::Translated))
+                    .update_translation(&key, &lang, translation, None)
+            } else {
+                self.codec.add_entry(
+                    &key,
+                    &lang,
+                    translation,
+                    None,
+                    Some(EntryStatus::Translated),
+                )
             };
             match result {
                 Ok(()) => {
                     self.dirty = true;
-                    self.status_message =
-                        Some(("Translation updated  [u] to undo".to_string(), StatusTone::Success));
+                    self.status_message = Some((
+                        "Translation updated  [u] to undo".to_string(),
+                        StatusTone::Success,
+                    ));
                 }
                 Err(e) => {
                     self.status_message = Some((format!("Error: {e}"), StatusTone::Error));
@@ -369,8 +374,7 @@ impl App {
         match result {
             Ok(()) => {
                 self.dirty = true;
-                self.status_message =
-                    Some(("Undo applied".to_string(), StatusTone::Success));
+                self.status_message = Some(("Undo applied".to_string(), StatusTone::Success));
             }
             Err(e) => {
                 self.status_message = Some((format!("Undo failed: {e}"), StatusTone::Error));
@@ -400,8 +404,7 @@ impl App {
             self.all_keys.retain(|k| k != &key);
             self.apply_filter();
             self.dirty = true;
-            self.status_message =
-                Some((format!("Deleted key '{key}'"), StatusTone::Success));
+            self.status_message = Some((format!("Deleted key '{key}'"), StatusTone::Success));
             self.redraw_token = !self.redraw_token;
         }
         self.confirm_delete = false;
@@ -427,7 +430,10 @@ impl App {
                 return;
             }
         }
-        self.status_message = Some(("No missing translations found".to_string(), StatusTone::Error));
+        self.status_message = Some((
+            "No missing translations found".to_string(),
+            StatusTone::Error,
+        ));
     }
 
     /// Jump to the previous key (wrapping) that has a missing translation.
@@ -447,7 +453,10 @@ impl App {
                 return;
             }
         }
-        self.status_message = Some(("No missing translations found".to_string(), StatusTone::Error));
+        self.status_message = Some((
+            "No missing translations found".to_string(),
+            StatusTone::Error,
+        ));
     }
 
     // ── Save ─────────────────────────────────────────────────────────────────
@@ -551,8 +560,7 @@ impl App {
         if self.languages.is_empty() {
             return;
         }
-        self.selected_lang_index =
-            (self.selected_lang_index + 1).min(self.languages.len() - 1);
+        self.selected_lang_index = (self.selected_lang_index + 1).min(self.languages.len() - 1);
         self.translation_scroll = 0;
     }
 

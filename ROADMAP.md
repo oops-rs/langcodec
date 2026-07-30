@@ -29,16 +29,23 @@ Legend: [ ] todo, [x] done, [~] in progress
 - [~] Strict vs. permissive parsing
   - [x] Global setting in lib; CLI `--strict` flag
   - [ ] Consistent error surfaces with actionable context
-- [ ] Better error context
-  - [ ] Include file path and entry id for parse/convert errors
+- [~] Better error context
+  - [x] Attach caller-visible file paths to path-based parser reads and writes
+  - [ ] Include entry id for parse/convert errors where available
   - [ ] (Optional) capture line/column when parser knows it
 
 ## M2. Formats
 
-- [ ] Apple `.stringsdict` (plurals/select)
+- [~] Apple `.stringsdict`
+  - [x] XML plist parse/write/convert for one bare `NSStringPluralRuleType` variable
+  - [x] Binary plist input with canonical XML output
+  - [x] Bare positional `%n$#@variable@` references
+  - [x] Explicit selector identity for generic `Resource` output
+  - [ ] Wrapper text, nested/select/gender rules, and multiple variables
 - [ ] Flutter `.arb`
 - [ ] Gettext `.po`
-- [ ] XLIFF 1.2 / 2.0
+- [x] XLIFF 1.2
+- [ ] XLIFF 2.0
 - [ ] (Later) ICU MessageFormat v2 (exploration)
 
 For each new format:
@@ -50,10 +57,11 @@ For each new format:
 
 ## M3. CSV/TSV Schema
 
-- [ ] Optional extended columns: `comment`, `status`, `context`, `developer_note`
+- [x] Automatically select a versioned extended schema when the wide schema would be lossy
+- [x] Round-trip resource/entry order, plurals, comments, status, domains, and custom metadata
+- [x] Deterministic output plus strict version/header/row validation
 - [ ] CLI: `--schema` flag (e.g., `basic`, `extended`, custom mapping)
-- [ ] Lossless round‑trip for supported metadata
-- [ ] Tests to ensure consistent ordering and schema stability
+- [ ] User-defined column mappings
 
 ## M4. CLI UX
 
@@ -64,13 +72,19 @@ For each new format:
   - [x] Per‑language counts by `EntryStatus`
   - [x] Completion percent (excludes DoNotTranslate)
   - [x] Missing plurals
-- [ ] `normalize` subcommand
-  - [ ] Canonicalize whitespace, escapes, key casing; optional rules
+- [x] `check` subcommand
+  - [x] Read-only parse, locale identity, structure, and CLDR plural checks
+  - [x] Normalized placeholder comparison for matching singular translations
+  - [x] Deterministic text and JSON reports with implicated paths
+- [x] `normalize` subcommand
+  - [x] Placeholder normalization, optional key style, dry-run, and CI `--check`
 - [ ] Filters and export
   - [ ] `view --where 'status=stale and lang in(en,fr)' --format csv`
   - [ ] `--grep` for key/value regex
 - [ ] Stdio support: `-` for stdin/stdout across commands
-- [ ] Config file: `langcodec.toml` for project defaults (langs, merge strategy, schema, placeholder policy)
+- [~] Config file
+  - [x] `langcodec.toml` for translate, annotate, and Tolgee workflows
+  - [ ] General command defaults (merge strategy, tabular schema, placeholder policy)
 
 ## M5. Developer Experience
 

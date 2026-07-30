@@ -1,14 +1,15 @@
 //! Support for TSV (Tab-Separated Values) localization format.
 //!
-//! Supports multi-language format where the first column is the key and subsequent columns are translations.
-//! Only singular key-value pairs are supported; plurals will be dropped during conversion.
-//! Provides parsing, serialization, and conversion to/from the internal `Resource` model.
+//! Supports the conventional wide `key,<language>...` schema for simple
+//! singular catalogs and the same versioned lossless schema as CSV.
+//! It uses the same automatic schema-selection rules as CSV.
 use std::{collections::HashMap, io::BufRead};
 
-use crate::{
-    error::Error,
-    traits::Parser,
-    types::{Entry, EntryStatus, Metadata, Resource, Translation},
+use crate::{error::Error, traits::Parser, types::Resource};
+
+use super::csv::{
+    BasicRecord, TabularSchema, parse_tabular, tabular_from_resources, tabular_into_resources,
+    write_tabular,
 };
 
 /// Represents a multi-language TSV record where the first column is the key
@@ -39,10 +40,14 @@ impl MultiLanguageTSVRecord {
     }
 }
 
-/// Represents the TSV format containing all records.
+/// Represents the TSV format containing all basic-schema records.
+///
+/// Lossless extended data is held privately. Construct values with
+/// [`Format::new`] or [`Format::with_records`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Format {
     pub records: Vec<MultiLanguageTSVRecord>,
+    schema: TabularSchema,
 }
 
 impl Format {
@@ -50,12 +55,20 @@ impl Format {
     pub fn new() -> Self {
         Self {
             records: Vec::new(),
+            schema: TabularSchema::Basic {
+                language_order: Vec::new(),
+            },
         }
     }
 
     /// Creates a new TSV format with the given records.
     pub fn with_records(records: Vec<MultiLanguageTSVRecord>) -> Self {
-        Self { records }
+        Self {
+            records,
+            schema: TabularSchema::Basic {
+                language_order: Vec::new(),
+            },
+        }
     }
 
     /// Adds a record to the format.
@@ -72,6 +85,11 @@ impl Format {
     pub fn get_records_mut(&mut self) -> &mut [MultiLanguageTSVRecord] {
         &mut self.records
     }
+
+    /// Returns whether this value uses langcodec's lossless extended schema.
+    pub fn is_extended(&self) -> bool {
+        matches!(&self.schema, TabularSchema::Extended { .. })
+    }
 }
 
 impl Default for Format {
@@ -81,127 +99,30 @@ impl Default for Format {
 }
 
 impl Parser for Format {
-    /// Parse from any reader, automatically detecting single vs multi-language format.
     fn from_reader<R: BufRead>(reader: R) -> Result<Self, Error> {
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(false)
-            .delimiter(b'\t')
-            .from_reader(reader);
-
-        let mut records = Vec::new();
-        let mut lines = rdr.records();
-
-        // Read the first line to determine the format
-        if let Some(first_line) = lines.next() {
-            let first_line = first_line.map_err(Error::CsvParse)?;
-
-            if first_line.len() == 2 {
-                if first_line[0].trim().eq_ignore_ascii_case("key") {
-                    // Single-language header form: key, <lang>
-                    let language = first_line[1].trim().to_string();
-                    if language.is_empty() {
-                        return Err(Error::DataMismatch(
-                            "Invalid TSV format: missing language in header".to_string(),
-                        ));
-                    }
-                    for line in lines {
-                        let line = line.map_err(Error::CsvParse)?;
-                        if line.len() == 2 {
-                            let mut record = MultiLanguageTSVRecord::new(line[0].to_string());
-                            record.add_translation(language.clone(), line[1].to_string());
-                            records.push(record);
-                        }
-                    }
-                } else {
-                    // Single language data form: key, value
-                    // First line is data, not header
-                    records.push(MultiLanguageTSVRecord {
-                        key: first_line[0].to_string(),
-                        translations: {
-                            let mut map = HashMap::new();
-                            map.insert("default".to_string(), first_line[1].to_string());
-                            map
-                        },
-                    });
-
-                    // Process remaining lines
-                    for line in lines {
-                        let line = line.map_err(Error::CsvParse)?;
-                        if line.len() == 2 {
-                            let mut record = MultiLanguageTSVRecord::new(line[0].to_string());
-                            record.add_translation("default".to_string(), line[1].to_string());
-                            records.push(record);
-                        }
-                    }
-                }
-            } else if first_line.len() >= 3 {
-                // Multi-language format: key, lang1, lang2, ...
-                let languages: Vec<String> =
-                    first_line.iter().skip(1).map(|s| s.to_string()).collect();
-
-                // First line is header, process remaining lines as data
-                for line in lines {
-                    let line = line.map_err(Error::CsvParse)?;
-                    if line.len() >= 2 {
-                        let mut record = MultiLanguageTSVRecord::new(line[0].to_string());
-                        for (i, lang) in languages.iter().enumerate() {
-                            if i + 1 < line.len() {
-                                record.add_translation(lang.clone(), line[i + 1].to_string());
-                            }
-                        }
-                        records.push(record);
-                    }
-                }
-            } else {
-                return Err(Error::DataMismatch(
-                    "Invalid TSV format: insufficient columns".to_string(),
-                ));
-            }
-        }
-
-        Ok(Format { records })
+        let (records, schema) = parse_tabular(reader, b'\t', "TSV")?;
+        Ok(Self {
+            records: records
+                .into_iter()
+                .map(|record| MultiLanguageTSVRecord {
+                    key: record.key,
+                    translations: record.translations,
+                })
+                .collect(),
+            schema,
+        })
     }
 
-    /// Write to any writer (file, memory, etc.).
     fn to_writer<W: std::io::Write>(&self, writer: W) -> Result<(), Error> {
-        if self.records.is_empty() {
-            return Ok(());
-        }
-
-        let mut wtr = csv::WriterBuilder::new()
-            .delimiter(b'\t')
-            .from_writer(writer);
-
-        // Get all unique languages from all records
-        let mut all_languages = std::collections::HashSet::new();
-        for record in &self.records {
-            for lang in record.translations.keys() {
-                all_languages.insert(lang.clone());
-            }
-        }
-
-        // Sort languages for consistent output
-        let mut sorted_languages: Vec<String> = all_languages.into_iter().collect();
-        sorted_languages.sort();
-
-        // Write header row
-        let mut header = vec!["key".to_string()];
-        header.extend(sorted_languages.clone());
-        wtr.write_record(&header).map_err(Error::CsvParse)?;
-
-        // Write data rows
-        for record in &self.records {
-            let mut row = vec![record.key.clone()];
-            let empty_string = String::new();
-            for lang in &sorted_languages {
-                let value = record.translations.get(lang).unwrap_or(&empty_string);
-                row.push(value.clone());
-            }
-            wtr.write_record(&row).map_err(Error::CsvParse)?;
-        }
-
-        wtr.flush().map_err(Error::Io)?;
-        Ok(())
+        let records = self
+            .records
+            .iter()
+            .map(|record| BasicRecord {
+                key: record.key.clone(),
+                translations: record.translations.clone(),
+            })
+            .collect::<Vec<_>>();
+        write_tabular(writer, b'\t', "TSV", &records, &self.schema)
     }
 }
 
@@ -209,38 +130,17 @@ impl TryFrom<Vec<Resource>> for Format {
     type Error = Error;
 
     fn try_from(resources: Vec<Resource>) -> Result<Self, Self::Error> {
-        if resources.is_empty() {
-            return Ok(Format::new());
-        }
-
-        // Get all unique keys across all resources
-        let mut all_keys = std::collections::HashSet::new();
-        for resource in &resources {
-            for entry in &resource.entries {
-                all_keys.insert(entry.id.clone());
-            }
-        }
-
-        // Create a multi-language record for each key
-        let mut records = Vec::new();
-        for key in all_keys {
-            let mut record = MultiLanguageTSVRecord::new(key);
-
-            for resource in &resources {
-                if let Some(entry) = resource.entries.iter().find(|e| e.id == record.key) {
-                    let value = match &entry.value {
-                        Translation::Empty => String::new(),
-                        Translation::Singular(v) => v.clone(),
-                        Translation::Plural(_) => String::new(), // Plurals not supported
-                    };
-                    record.add_translation(resource.metadata.language.clone(), value);
-                }
-            }
-
-            records.push(record);
-        }
-
-        Ok(Format { records })
+        let (records, schema) = tabular_from_resources(resources)?;
+        Ok(Self {
+            records: records
+                .into_iter()
+                .map(|record| MultiLanguageTSVRecord {
+                    key: record.key,
+                    translations: record.translations,
+                })
+                .collect(),
+            schema,
+        })
     }
 }
 
@@ -248,60 +148,15 @@ impl TryFrom<Format> for Vec<Resource> {
     type Error = Error;
 
     fn try_from(format: Format) -> Result<Self, Self::Error> {
-        if format.records.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Get all unique languages
-        let mut all_languages = std::collections::HashSet::new();
-        for record in &format.records {
-            for lang in record.translations.keys() {
-                all_languages.insert(lang.clone());
-            }
-        }
-
-        // Create a resource for each language
-        let mut resources = Vec::new();
-        let mut custom_metadata = HashMap::new();
-
-        // Add required metadata for XCStrings compatibility
-        // Use the first language as source language, or "en" as default
-        let source_language = all_languages
-            .iter()
-            .next()
-            .unwrap_or(&"en".to_string())
-            .clone();
-        custom_metadata.insert("source_language".to_string(), source_language);
-        custom_metadata.insert("version".to_string(), "1.0".to_string());
-
-        for language in all_languages {
-            let mut resource = Resource {
-                metadata: Metadata {
-                    language: language.clone(),
-                    domain: String::from(""),
-                    custom: custom_metadata.clone(),
-                },
-                entries: Vec::new(),
-            };
-
-            for record in &format.records {
-                if let Some(translation) = record.translations.get(&language) {
-                    resource.entries.push(Entry {
-                        id: record.key.clone(),
-                        value: Translation::Singular(translation.clone()),
-                        comment: None,
-                        status: EntryStatus::Translated,
-                        custom: HashMap::new(),
-                    });
-                }
-            }
-
-            if !resource.entries.is_empty() {
-                resources.push(resource);
-            }
-        }
-
-        Ok(resources)
+        let records = format
+            .records
+            .into_iter()
+            .map(|record| BasicRecord {
+                key: record.key,
+                translations: record.translations,
+            })
+            .collect();
+        tabular_into_resources(records, format.schema)
     }
 }
 

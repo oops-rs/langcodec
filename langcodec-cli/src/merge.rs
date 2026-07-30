@@ -25,12 +25,15 @@ fn resolve_merge_output_format(
 
     let path_language = match &output_format {
         langcodec::FormatType::Strings(Some(language))
+        | langcodec::FormatType::Stringsdict(Some(language))
         | langcodec::FormatType::AndroidStrings(Some(language)) => Some(language.clone()),
         _ => None,
     };
 
     match &output_format {
-        langcodec::FormatType::Strings(_) | langcodec::FormatType::AndroidStrings(_) => {
+        langcodec::FormatType::Strings(_)
+        | langcodec::FormatType::Stringsdict(_)
+        | langcodec::FormatType::AndroidStrings(_) => {
             if let Some(language) = lang {
                 if let Some(path_language) = path_language
                     && path_language != *language

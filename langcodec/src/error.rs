@@ -3,6 +3,7 @@
 //! These are returned from all fallible operations (parsing, serialization, conversion, etc.).
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use thiserror::Error;
 
 /// Stable machine-readable category for [`enum@Error`].
@@ -96,6 +97,14 @@ pub enum Error {
 
     #[error("policy violation: {0}")]
     PolicyViolation(String),
+
+    /// Adds path metadata without changing the underlying error category or source.
+    #[error("{source} (path: `{path}`)")]
+    WithPath {
+        path: String,
+        #[source]
+        source: Box<Error>,
+    },
 }
 
 impl Error {
@@ -128,6 +137,14 @@ impl Error {
         Error::PolicyViolation(message.into())
     }
 
+    /// Attaches a filesystem path while retaining this error as the source.
+    pub fn with_path(self, path: impl AsRef<Path>) -> Self {
+        Error::WithPath {
+            path: path.as_ref().to_string_lossy().into_owned(),
+            source: Box::new(self),
+        }
+    }
+
     /// Returns a machine-readable error code.
     pub fn error_code(&self) -> ErrorCode {
         match self {
@@ -144,6 +161,7 @@ impl Error {
             Error::MissingLanguage { .. } => ErrorCode::MissingLanguage,
             Error::AmbiguousMatch { .. } => ErrorCode::AmbiguousMatch,
             Error::PolicyViolation(_) => ErrorCode::PolicyViolation,
+            Error::WithPath { source, .. } => source.error_code(),
         }
     }
 
@@ -165,6 +183,11 @@ impl Error {
                 candidates: candidates.clone(),
                 ..ErrorContext::default()
             }),
+            Error::WithPath { path, source } => {
+                let mut context = source.context().unwrap_or_default();
+                context.path = Some(path.clone());
+                Some(context)
+            }
             _ => None,
         }
     }

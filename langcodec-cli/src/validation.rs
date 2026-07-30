@@ -148,13 +148,13 @@ pub fn validate_standard_format(format: &str) -> Result<(), String> {
     // Trim whitespace and check if it's a supported standard format
     match format.trim().to_lowercase().as_str() {
         "android" | "androidstrings" | "xml" => Ok(()),
-        "strings" => Ok(()),
+        "strings" | "stringsdict" => Ok(()),
         "xcstrings" => Ok(()),
         "xliff" => Ok(()),
         "csv" => Ok(()),
         "tsv" => Ok(()),
         _ => Err(format!(
-            "Unsupported standard format: {}. Supported formats: android, strings, xcstrings, xliff, csv, tsv",
+            "Unsupported standard format: {}. Supported formats: android, strings, stringsdict, xcstrings, xliff, csv, tsv",
             format
         )),
     }

@@ -7,8 +7,8 @@ use crate::{
     ConflictStrategy,
     error::Error,
     formats::{
-        AndroidStringsFormat, CSVFormat, FormatType, StringsFormat, TSVFormat, XcstringsFormat,
-        XliffFormat,
+        AndroidStringsFormat, CSVFormat, FormatType, StringsFormat, StringsdictFormat, TSVFormat,
+        XcstringsFormat, XliffFormat,
     },
     placeholder::normalize_placeholders,
     traits::Parser,
@@ -42,6 +42,7 @@ fn single_language_output_label(output_format: &FormatType) -> &'static str {
     match output_format {
         FormatType::AndroidStrings(_) => "Android strings.xml",
         FormatType::Strings(_) => "Apple .strings",
+        FormatType::Stringsdict(_) => "Apple .stringsdict",
         FormatType::Xcstrings | FormatType::Xliff(_) | FormatType::CSV | FormatType::TSV => {
             "single-language"
         }
@@ -50,11 +51,13 @@ fn single_language_output_label(output_format: &FormatType) -> &'static str {
 
 fn should_propagate_input_language(input_format: &FormatType, output_format: &FormatType) -> bool {
     matches!(
-        (input_format, output_format),
-        (FormatType::AndroidStrings(_), FormatType::AndroidStrings(_))
-            | (FormatType::AndroidStrings(_), FormatType::Strings(_))
-            | (FormatType::Strings(_), FormatType::AndroidStrings(_))
-            | (FormatType::Strings(_), FormatType::Strings(_))
+        input_format,
+        FormatType::AndroidStrings(_) | FormatType::Strings(_) | FormatType::Stringsdict(_)
+    ) && matches!(
+        output_format,
+        FormatType::AndroidStrings(None)
+            | FormatType::Strings(None)
+            | FormatType::Stringsdict(None)
     )
 }
 
@@ -91,7 +94,9 @@ fn select_single_language_resource(
     let output_label = single_language_output_label(output_format);
 
     match output_format {
-        FormatType::AndroidStrings(Some(language)) | FormatType::Strings(Some(language)) => {
+        FormatType::AndroidStrings(Some(language))
+        | FormatType::Strings(Some(language))
+        | FormatType::Stringsdict(Some(language)) => {
             let matches = resources
                 .iter()
                 .filter(|resource| resource.metadata.language == *language)
@@ -108,7 +113,9 @@ fn select_single_language_resource(
                 ))),
             }
         }
-        FormatType::AndroidStrings(None) | FormatType::Strings(None) => match resources {
+        FormatType::AndroidStrings(None)
+        | FormatType::Strings(None)
+        | FormatType::Stringsdict(None) => match resources {
             [resource] => Ok(resource.clone()),
             _ => Err(Error::InvalidResource(format!(
                 "{output_label} output is single-language, but {} resources were provided (languages: {}). Use --output-lang or a language-specific output path.",
@@ -165,44 +172,31 @@ pub fn convert_resources_to_format(
     match &output_format {
         FormatType::AndroidStrings(_) => {
             let resource = select_single_language_resource(&resources, &output_format)?;
-            AndroidStringsFormat::from(resource)
-                .write_to(Path::new(output_path))
-                .map_err(|e| {
-                    Error::conversion_error(
-                        format!("Error writing AndroidStrings output: {}", e),
-                        None,
-                    )
-                })
+            AndroidStringsFormat::from(resource).write_to(Path::new(output_path))
         }
         FormatType::Strings(_) => {
             let resource = select_single_language_resource(&resources, &output_format)?;
             StringsFormat::try_from(resource)
-                .and_then(|f| f.write_to(Path::new(output_path)))
-                .map_err(|e| {
-                    Error::conversion_error(format!("Error writing Strings output: {}", e), None)
-                })
+                .and_then(|format| format.write_to(Path::new(output_path)))
+        }
+        FormatType::Stringsdict(_) => {
+            let resource = select_single_language_resource(&resources, &output_format)?;
+            StringsdictFormat::try_from(resource)
+                .and_then(|format| format.write_to(Path::new(output_path)))
         }
         FormatType::Xcstrings => {
             ensure_xcstrings_metadata(&mut resources);
             XcstringsFormat::try_from(resources)
-                .and_then(|f| f.write_to(Path::new(output_path)))
-                .map_err(|e| {
-                    Error::conversion_error(format!("Error writing Xcstrings output: {}", e), None)
-                })
+                .and_then(|format| format.write_to(Path::new(output_path)))
         }
         FormatType::Xliff(target_language) => {
             XliffFormat::from_resources(resources, None, target_language.as_deref())
-                .and_then(|f| f.write_to(Path::new(output_path)))
-                .map_err(|e| {
-                    Error::conversion_error(format!("Error writing XLIFF output: {}", e), None)
-                })
+                .and_then(|format| format.write_to(Path::new(output_path)))
         }
         FormatType::CSV => CSVFormat::try_from(resources)
-            .and_then(|f| f.write_to(Path::new(output_path)))
-            .map_err(|e| Error::conversion_error(format!("Error writing CSV output: {}", e), None)),
+            .and_then(|format| format.write_to(Path::new(output_path))),
         FormatType::TSV => TSVFormat::try_from(resources)
-            .and_then(|f| f.write_to(Path::new(output_path)))
-            .map_err(|e| Error::conversion_error(format!("Error writing TSV output: {}", e), None)),
+            .and_then(|format| format.write_to(Path::new(output_path))),
     }
 }
 
@@ -258,6 +252,7 @@ pub fn convert<P: AsRef<Path>>(
     let mut resources = match input_format {
         FormatType::AndroidStrings(_) => vec![AndroidStringsFormat::read_from(input)?.into()],
         FormatType::Strings(_) => vec![StringsFormat::read_from(input)?.into()],
+        FormatType::Stringsdict(_) => vec![StringsdictFormat::read_from(input)?.into()],
         FormatType::Xcstrings => Vec::<Resource>::try_from(XcstringsFormat::read_from(input)?)?,
         FormatType::Xliff(_) => Vec::<Resource>::try_from(XliffFormat::read_from(input)?)?,
         FormatType::CSV => Vec::<Resource>::try_from(CSVFormat::read_from(input)?)?,
@@ -286,6 +281,10 @@ pub fn convert<P: AsRef<Path>>(
             let resource = select_single_language_resource(&resources, &output_format)?;
             StringsFormat::try_from(resource)?.write_to(output)
         }
+        FormatType::Stringsdict(_) => {
+            let resource = select_single_language_resource(&resources, &output_format)?;
+            StringsdictFormat::try_from(resource)?.write_to(output)
+        }
         FormatType::Xcstrings => XcstringsFormat::try_from(resources)?.write_to(output),
         FormatType::Xliff(target_language) => {
             XliffFormat::from_resources(resources, None, target_language.as_deref())?
@@ -300,7 +299,10 @@ pub fn convert<P: AsRef<Path>>(
 ///
 /// When `normalize` is true, common iOS placeholder tokens like `%@`, `%1$@`, `%ld` are
 /// converted to canonical forms (`%s`, `%1$s`, `%d`) prior to serialization.
-/// Convert with optional placeholder normalization.
+///
+/// Placeholder normalization is rejected when either endpoint is Apple `.stringsdict`,
+/// because changing a plural form's placeholder can invalidate its
+/// `NSStringFormatValueTypeKey`. Pass `false` to preserve `.stringsdict` placeholders.
 ///
 /// Example
 /// ```rust,no_run
@@ -325,6 +327,16 @@ pub fn convert_with_normalization<P: AsRef<Path>>(
     let input = input.as_ref();
     let output = output.as_ref();
 
+    if normalize
+        && (matches!(&input_format, FormatType::Stringsdict(_))
+            || matches!(&output_format, FormatType::Stringsdict(_)))
+    {
+        return Err(Error::UnsupportedFormat(
+            "placeholder normalization cannot be used with Apple .stringsdict because changing plural placeholders can invalidate NSStringFormatValueTypeKey; disable normalization for this conversion"
+                .to_string(),
+        ));
+    }
+
     // Carry language between single-language formats
     let output_format = if should_propagate_input_language(&input_format, &output_format) {
         input_format
@@ -346,6 +358,7 @@ pub fn convert_with_normalization<P: AsRef<Path>>(
     let mut resources = match input_format {
         FormatType::AndroidStrings(_) => vec![AndroidStringsFormat::read_from(input)?.into()],
         FormatType::Strings(_) => vec![StringsFormat::read_from(input)?.into()],
+        FormatType::Stringsdict(_) => vec![StringsdictFormat::read_from(input)?.into()],
         FormatType::Xcstrings => Vec::<Resource>::try_from(XcstringsFormat::read_from(input)?)?,
         FormatType::Xliff(_) => Vec::<Resource>::try_from(XliffFormat::read_from(input)?)?,
         FormatType::CSV => Vec::<Resource>::try_from(CSVFormat::read_from(input)?)?,
@@ -393,6 +406,10 @@ pub fn convert_with_normalization<P: AsRef<Path>>(
         FormatType::Strings(_) => {
             let resource = select_single_language_resource(&resources, &output_format)?;
             StringsFormat::try_from(resource)?.write_to(output)
+        }
+        FormatType::Stringsdict(_) => {
+            let resource = select_single_language_resource(&resources, &output_format)?;
+            StringsdictFormat::try_from(resource)?.write_to(output)
         }
         FormatType::Xcstrings => XcstringsFormat::try_from(resources)?.write_to(output),
         FormatType::Xliff(target_language) => {
@@ -481,8 +498,10 @@ mod normalize_tests {
     }
 }
 
-/// Auto-infer formats from paths and convert, with optional placeholder normalization.
 /// Auto-infer formats and convert with optional placeholder normalization.
+///
+/// As with [`convert_with_normalization`], normalization is not supported when either
+/// inferred endpoint is Apple `.stringsdict`.
 ///
 /// Example
 /// ```rust,no_run
@@ -554,6 +573,7 @@ pub fn infer_format_from_extension<P: AsRef<Path>>(path: P) -> Option<FormatType
 
     match extension.to_lowercase().as_str() {
         "strings" => Some(FormatType::Strings(None)),
+        "stringsdict" => Some(FormatType::Stringsdict(None)),
         "xml" => Some(FormatType::AndroidStrings(None)),
         "xcstrings" => Some(FormatType::Xcstrings),
         "xliff" => Some(FormatType::Xliff(None)),
@@ -601,7 +621,7 @@ pub fn infer_format_from_path<P: AsRef<Path>>(path: P) -> Option<FormatType> {
             FormatType::Xcstrings | FormatType::Xliff(_) | FormatType::CSV | FormatType::TSV => {
                 Some(format)
             }
-            FormatType::AndroidStrings(_) | FormatType::Strings(_) => {
+            FormatType::AndroidStrings(_) | FormatType::Strings(_) | FormatType::Stringsdict(_) => {
                 let lang = infer_language_from_path(&path, &format).ok().flatten();
                 Some(format.with_language(lang))
             }
@@ -755,14 +775,14 @@ pub fn infer_language_from_path<P: AsRef<Path>>(
 
     for comp in components {
         match format {
-            FormatType::Strings(_) => {
-                // Apple: directory like zh-Hans.lproj, or filename like en.strings
+            FormatType::Strings(_) | FormatType::Stringsdict(_) => {
+                // Apple: directory like zh-Hans.lproj, or filename like en.strings[dict]
                 if let Some(lang_dir) = comp.strip_suffix(".lproj")
                     && let Some(lang) = normalize_lang(lang_dir)
                 {
                     return Ok(Some(lang));
                 }
-                if comp.ends_with(".strings")
+                if (comp.ends_with(".strings") || comp.ends_with(".stringsdict"))
                     && let Some(stem) = Path::new(&comp).file_stem().and_then(|s| s.to_str())
                 {
                     let looks_like_lang = (stem.len() == 2
@@ -804,25 +824,62 @@ pub fn infer_language_from_path<P: AsRef<Path>>(
 /// `Ok(())` if writing succeeds, or an `Error` if the format is unsupported or writing fails.
 pub fn write_resources_to_file(resources: &[Resource], file_path: &String) -> Result<(), Error> {
     let path = Path::new(&file_path);
-
-    if let Some(first) = resources.first() {
-        match first.metadata.custom.get("format").map(String::as_str) {
-            Some("AndroidStrings") => AndroidStringsFormat::from(first.clone()).write_to(path)?,
-            Some("Strings") => StringsFormat::try_from(first.clone())?.write_to(path)?,
-            Some("Xcstrings") => XcstringsFormat::try_from(resources.to_vec())?.write_to(path)?,
-            Some("xliff") | Some("Xliff") => {
-                XliffFormat::try_from(resources.to_vec())?.write_to(path)?
-            }
-            Some("CSV") => CSVFormat::try_from(resources.to_vec())?.write_to(path)?,
-            Some("TSV") => TSVFormat::try_from(resources.to_vec())?.write_to(path)?,
-            _ => Err(Error::UnsupportedFormat(format!(
-                "Unsupported format: {:?}",
-                first.metadata.custom.get("format")
-            )))?,
-        }
+    if resources.is_empty() {
+        return Err(Error::InvalidResource("No resources to write".to_string()));
     }
 
-    Ok(())
+    let stored_formats = resources
+        .iter()
+        .map(|resource| resource.metadata.custom.get("format").map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    if stored_formats.len() != 1 {
+        return Err(Error::InvalidResource(format!(
+            "Resources do not identify one consistent output format: {stored_formats:?}"
+        )));
+    }
+    let stored_format = stored_formats.into_iter().next().flatten();
+
+    match stored_format {
+        Some("AndroidStrings") | Some("android") => match resources {
+            [resource] => AndroidStringsFormat::from(resource.clone()).write_to(path),
+            _ => Err(Error::InvalidResource(format!(
+                "Android strings.xml output is single-language, but {} resources were provided; merge or select exactly one resource before writing",
+                resources.len()
+            ))),
+        },
+        Some("Strings") | Some("strings") => match resources {
+            [resource] => {
+                StringsFormat::try_from(resource.clone()).and_then(|format| format.write_to(path))
+            }
+            _ => Err(Error::InvalidResource(format!(
+                "Apple .strings output is single-language, but {} resources were provided; merge or select exactly one resource before writing",
+                resources.len()
+            ))),
+        },
+        Some("stringsdict") | Some("Stringsdict") => match resources {
+            [resource] => StringsdictFormat::try_from(resource.clone())
+                .and_then(|format| format.write_to(path)),
+            _ => Err(Error::InvalidResource(format!(
+                "Apple .stringsdict output is single-language, but {} resources were provided; merge or select exactly one resource before writing",
+                resources.len()
+            ))),
+        },
+        Some("Xcstrings") | Some("xcstrings") => {
+            XcstringsFormat::try_from(resources.to_vec()).and_then(|format| format.write_to(path))
+        }
+        Some("xliff") | Some("Xliff") => {
+            XliffFormat::try_from(resources.to_vec()).and_then(|format| format.write_to(path))
+        }
+        Some("CSV") | Some("csv") => {
+            CSVFormat::try_from(resources.to_vec()).and_then(|format| format.write_to(path))
+        }
+        Some("TSV") | Some("tsv") => {
+            TSVFormat::try_from(resources.to_vec()).and_then(|format| format.write_to(path))
+        }
+        _ => Err(Error::UnsupportedFormat(format!(
+            "Unsupported format: {stored_format:?}"
+        ))),
+    }
 }
 
 /// Merges multiple resources into a single resource with conflict resolution.
@@ -1220,6 +1277,113 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("single-language"));
+    }
+
+    #[test]
+    fn test_convert_rejects_explicit_language_mismatch_without_touching_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("Localizable.strings");
+        let output = tmp.path().join("strings.xml");
+        std::fs::write(&input, "\"hello\" = \"Bonjour\";\n").unwrap();
+        std::fs::write(&output, "sentinel").unwrap();
+
+        let error = convert(
+            &input,
+            FormatType::Strings(Some("fr".into())),
+            &output,
+            FormatType::AndroidStrings(Some("en".into())),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error_code(), crate::ErrorCode::InvalidResource);
+        assert!(error.to_string().contains("must match in language"));
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "sentinel");
+    }
+
+    #[test]
+    fn test_convert_with_normalization_rejects_explicit_language_mismatch_without_touching_output()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("Localizable.strings");
+        let output = tmp.path().join("strings.xml");
+        std::fs::write(&input, "\"hello\" = \"Bonjour %@\";\n").unwrap();
+        std::fs::write(&output, "sentinel").unwrap();
+
+        let error = convert_with_normalization(
+            &input,
+            FormatType::Strings(Some("fr".into())),
+            &output,
+            FormatType::AndroidStrings(Some("en".into())),
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error_code(), crate::ErrorCode::InvalidResource);
+        assert!(error.to_string().contains("must match in language"));
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "sentinel");
+    }
+
+    #[test]
+    fn test_convert_propagates_input_language_only_when_output_has_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("Localizable.strings");
+        let output = tmp.path().join("strings.xml");
+        std::fs::write(&input, "\"hello\" = \"Bonjour\";\n").unwrap();
+
+        convert(
+            &input,
+            FormatType::Strings(Some("fr".into())),
+            &output,
+            FormatType::AndroidStrings(None),
+        )
+        .unwrap();
+
+        let parsed = AndroidStringsFormat::read_from(&output).unwrap();
+        assert_eq!(parsed.strings.len(), 1);
+        assert_eq!(parsed.strings[0].value, "Bonjour");
+    }
+
+    #[test]
+    fn test_write_resources_rejects_all_ambiguous_single_language_formats_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        for (stored_format, file_name) in [
+            ("android", "strings.xml"),
+            ("strings", "Localizable.strings"),
+            ("stringsdict", "Localizable.stringsdict"),
+        ] {
+            let output = tmp.path().join(file_name);
+            std::fs::write(&output, "sentinel").unwrap();
+
+            let mut first = build_resource("en", &[("hello", "Hello")]);
+            first
+                .metadata
+                .custom
+                .insert("format".to_string(), stored_format.to_string());
+            let mut second = build_resource("fr", &[("hello", "Bonjour")]);
+            second
+                .metadata
+                .custom
+                .insert("format".to_string(), stored_format.to_string());
+
+            let output_path = output.to_string_lossy().into_owned();
+            let error = write_resources_to_file(&[first, second], &output_path).unwrap_err();
+
+            assert_eq!(
+                error.error_code(),
+                crate::ErrorCode::InvalidResource,
+                "unexpected error category for {stored_format}"
+            );
+            assert!(
+                error.to_string().contains("single-language"),
+                "unexpected error for {stored_format}: {error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&output).unwrap(),
+                "sentinel",
+                "{stored_format} output was modified before ambiguity was rejected"
+            );
+        }
     }
 
     fn build_resource(language: &str, pairs: &[(&str, &str)]) -> Resource {

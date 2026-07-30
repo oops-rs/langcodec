@@ -4,7 +4,7 @@ use langcodec::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -84,6 +84,12 @@ struct MergeReport {
 }
 
 #[derive(Debug, Clone)]
+struct AllowedLanguageMapping {
+    pulled_language: String,
+    local_language: String,
+}
+
+#[derive(Debug, Clone)]
 enum TolgeeCliInvocation {
     Direct(PathBuf),
     PnpmExec,
@@ -123,7 +129,7 @@ pub fn run_tolgee_pull_command(opts: TolgeePullOptions) -> Result<(), String> {
         let pulled_codec = pulled
             .get(&mapping.namespace)
             .ok_or_else(|| format!("Tolgee did not export namespace '{}'", mapping.namespace))?;
-        let report = merge_tolgee_catalog(&mut local_codec, pulled_codec, &[]);
+        let report = merge_tolgee_catalog(&mut local_codec, pulled_codec, &[])?;
 
         println!(
             "Namespace {} -> {} merged={} skipped_new_keys={}",
@@ -227,7 +233,7 @@ pub fn prefill_translate_from_tolgee(
     let pulled_codec = pulled
         .get(&mapping.namespace)
         .ok_or_else(|| format!("Tolgee did not export namespace '{}'", mapping.namespace))?;
-    merge_tolgee_catalog(target_codec, pulled_codec, target_langs);
+    merge_tolgee_catalog(target_codec, pulled_codec, target_langs)?;
 
     Ok(Some(TranslateTolgeeContext {
         project,
@@ -850,7 +856,11 @@ fn merge_tolgee_catalog(
     local_codec: &mut Codec,
     pulled_codec: &Codec,
     allowed_langs: &[String],
-) -> MergeReport {
+) -> Result<MergeReport, String> {
+    validate_unique_language_identities(local_codec, "Local catalog")?;
+    validate_unique_language_identities(pulled_codec, "Pulled Tolgee catalog")?;
+    let allowed_languages = resolve_allowed_languages(local_codec, pulled_codec, allowed_langs)?;
+
     let existing_keys = local_codec
         .resources
         .iter()
@@ -859,63 +869,200 @@ fn merge_tolgee_catalog(
     let mut report = MergeReport::default();
 
     for pulled_resource in &pulled_codec.resources {
-        if !allowed_langs.is_empty()
-            && !allowed_langs
+        let local_languages = if allowed_langs.is_empty() {
+            vec![pulled_resource.metadata.language.clone()]
+        } else {
+            allowed_languages
                 .iter()
-                .any(|lang| lang_matches(lang, &pulled_resource.metadata.language))
-        {
-            continue;
-        }
+                .filter(|mapping| {
+                    language_identity_eq(
+                        &mapping.pulled_language,
+                        &pulled_resource.metadata.language,
+                    )
+                })
+                .map(|mapping| mapping.local_language.clone())
+                .collect::<Vec<_>>()
+        };
 
-        ensure_resource(local_codec, &pulled_resource.metadata);
+        for destination_language in local_languages {
+            let mut local_metadata = pulled_resource.metadata.clone();
+            local_metadata.language = destination_language;
+            let local_language = ensure_resource(local_codec, &local_metadata);
 
-        for pulled_entry in &pulled_resource.entries {
-            if !existing_keys.contains(&pulled_entry.id) {
-                report.skipped_new_keys += 1;
-                continue;
-            }
-            if translation_is_empty(&pulled_entry.value) {
-                continue;
-            }
-
-            if let Some(existing) =
-                local_codec.find_entry_mut(&pulled_entry.id, &pulled_resource.metadata.language)
-            {
-                if existing.value != pulled_entry.value
-                    || existing.status != pulled_entry.status
-                    || existing.comment != pulled_entry.comment
-                {
-                    existing.value = pulled_entry.value.clone();
-                    existing.status = pulled_entry.status.clone();
-                    existing.comment = pulled_entry.comment.clone();
-                    report.merged += 1;
+            for pulled_entry in &pulled_resource.entries {
+                if !existing_keys.contains(&pulled_entry.id) {
+                    report.skipped_new_keys += 1;
+                    continue;
                 }
-                continue;
-            }
+                if translation_is_empty(&pulled_entry.value) {
+                    continue;
+                }
 
-            let _ = local_codec.add_entry(
-                &pulled_entry.id,
-                &pulled_resource.metadata.language,
-                pulled_entry.value.clone(),
-                pulled_entry.comment.clone(),
-                Some(pulled_entry.status.clone()),
-            );
-            report.merged += 1;
+                if let Some(existing) = find_entry_mut_by_language_identity(
+                    local_codec,
+                    &pulled_entry.id,
+                    &local_language,
+                ) {
+                    if existing.value != pulled_entry.value
+                        || existing.status != pulled_entry.status
+                        || existing.comment != pulled_entry.comment
+                    {
+                        existing.value = pulled_entry.value.clone();
+                        existing.status = pulled_entry.status.clone();
+                        existing.comment = pulled_entry.comment.clone();
+                        report.merged += 1;
+                    }
+                    continue;
+                }
+
+                let _ = local_codec.add_entry(
+                    &pulled_entry.id,
+                    &local_language,
+                    pulled_entry.value.clone(),
+                    pulled_entry.comment.clone(),
+                    Some(pulled_entry.status.clone()),
+                );
+                report.merged += 1;
+            }
         }
     }
 
-    report
+    Ok(report)
 }
 
-fn ensure_resource(codec: &mut Codec, metadata: &Metadata) {
-    if codec.get_by_language(&metadata.language).is_some() {
-        return;
+fn resolve_allowed_languages(
+    local_codec: &Codec,
+    pulled_codec: &Codec,
+    requested_languages: &[String],
+) -> Result<Vec<AllowedLanguageMapping>, String> {
+    if requested_languages.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let available = pulled_codec
+        .resources
+        .iter()
+        .map(|resource| resource.metadata.language.as_str())
+        .collect::<Vec<_>>();
+    let mut resolved = Vec::<AllowedLanguageMapping>::new();
+
+    for requested in requested_languages {
+        let pulled_language = if let Some(exact) = available
+            .iter()
+            .copied()
+            .find(|candidate| language_identity_eq(candidate, requested))
+        {
+            exact.to_string()
+        } else {
+            let normalized_requested = normalize_lang(requested);
+            if normalized_requested.contains('-') {
+                requested.clone()
+            } else {
+                let mut variants = available
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        normalize_lang(candidate)
+                            .split('-')
+                            .next()
+                            .is_some_and(|language| language == normalized_requested.as_str())
+                    })
+                    .collect::<Vec<_>>();
+                match variants.len() {
+                    0 => requested.clone(),
+                    1 => variants[0].to_string(),
+                    _ => {
+                        variants.sort_by_key(|candidate| normalize_lang(candidate));
+                        return Err(format!(
+                            "Tolgee target language '{}' is ambiguous; matching variants: {}. Specify a fully-qualified target language",
+                            requested,
+                            variants.join(", ")
+                        ));
+                    }
+                }
+            }
+        };
+        let local_language = find_resource_by_language_identity(local_codec, requested)
+            .map(|resource| resource.metadata.language.clone())
+            .unwrap_or_else(|| requested.clone());
+
+        if !resolved.iter().any(|existing| {
+            language_identity_eq(&existing.pulled_language, &pulled_language)
+                && language_identity_eq(&existing.local_language, &local_language)
+        }) {
+            resolved.push(AllowedLanguageMapping {
+                pulled_language,
+                local_language,
+            });
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn ensure_resource(codec: &mut Codec, metadata: &Metadata) -> String {
+    if let Some(existing) = find_resource_by_language_identity(codec, &metadata.language) {
+        return existing.metadata.language.clone();
     }
 
     codec.add_resource(Resource {
         metadata: metadata.clone(),
         entries: Vec::new(),
     });
+    metadata.language.clone()
+}
+
+fn validate_unique_language_identities(codec: &Codec, label: &str) -> Result<(), String> {
+    let mut languages_by_identity = BTreeMap::<String, Vec<String>>::new();
+    for resource in &codec.resources {
+        languages_by_identity
+            .entry(normalize_lang(&resource.metadata.language))
+            .or_default()
+            .push(resource.metadata.language.clone());
+    }
+
+    let duplicates = languages_by_identity
+        .into_iter()
+        .filter_map(|(identity, mut languages)| {
+            if languages.len() < 2 {
+                return None;
+            }
+            languages.sort();
+            Some(format!("{} ({})", identity, languages.join(", ")))
+        })
+        .collect::<Vec<_>>();
+
+    if duplicates.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} contains duplicate normalized language identities: {}",
+            label,
+            duplicates.join("; ")
+        ))
+    }
+}
+
+fn find_resource_by_language_identity<'a>(
+    codec: &'a Codec,
+    language: &str,
+) -> Option<&'a Resource> {
+    codec
+        .resources
+        .iter()
+        .find(|resource| language_identity_eq(&resource.metadata.language, language))
+}
+
+fn find_entry_mut_by_language_identity<'a>(
+    codec: &'a mut Codec,
+    key: &str,
+    language: &str,
+) -> Option<&'a mut langcodec::Entry> {
+    codec
+        .resources
+        .iter_mut()
+        .find(|resource| language_identity_eq(&resource.metadata.language, language))
+        .and_then(|resource| resource.find_entry_mut(key))
 }
 
 fn translation_is_empty(translation: &Translation) -> bool {
@@ -955,21 +1102,44 @@ fn write_xcstrings_codec(codec: &Codec, path: &Path) -> Result<(), String> {
     .map_err(|e| format!("Failed to write '{}': {}", path.display(), e))
 }
 
-fn lang_matches(left: &str, right: &str) -> bool {
+fn language_identity_eq(left: &str, right: &str) -> bool {
     normalize_lang(left) == normalize_lang(right)
-        || normalize_lang(left).split('-').next().unwrap_or(left)
-            == normalize_lang(right).split('-').next().unwrap_or(right)
 }
 
 fn normalize_lang(value: &str) -> String {
-    value.trim().replace('_', "-").to_ascii_lowercase()
+    let normalized = value.trim().replace('_', "-");
+    normalized
+        .parse::<unic_langid::LanguageIdentifier>()
+        .map(|language| language.to_string().to_ascii_lowercase())
+        .unwrap_or_else(|_| normalized.to_ascii_lowercase())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use langcodec::EntryStatus;
+    use langcodec::{Entry, EntryStatus};
     use tempfile::TempDir;
+
+    fn test_entry(id: &str, value: Translation) -> Entry {
+        Entry {
+            id: id.to_string(),
+            value,
+            comment: None,
+            status: EntryStatus::Translated,
+            custom: HashMap::new(),
+        }
+    }
+
+    fn test_resource(language: &str, entries: Vec<Entry>) -> Resource {
+        Resource {
+            metadata: Metadata {
+                language: language.to_string(),
+                domain: String::new(),
+                custom: HashMap::new(),
+            },
+            entries,
+        }
+    }
 
     #[test]
     fn merge_tolgee_catalog_updates_existing_keys_and_skips_new_ones() {
@@ -1015,7 +1185,7 @@ mod tests {
             }],
         };
 
-        let report = merge_tolgee_catalog(&mut local, &pulled, &[]);
+        let report = merge_tolgee_catalog(&mut local, &pulled, &[]).unwrap();
         assert_eq!(report.merged, 1);
         assert_eq!(report.skipped_new_keys, 1);
 
@@ -1026,6 +1196,271 @@ mod tests {
         );
         assert_eq!(fr_entry.comment.as_deref(), Some("Greeting"));
         assert!(local.find_entry("new_only", "fr").is_none());
+    }
+
+    #[test]
+    fn merge_tolgee_catalog_keeps_script_variants_distinct() {
+        let mut local = Codec {
+            resources: vec![test_resource(
+                "en",
+                vec![test_entry(
+                    "welcome",
+                    Translation::Singular("Welcome".to_string()),
+                )],
+            )],
+        };
+        let pulled = Codec {
+            resources: vec![
+                test_resource(
+                    "zh-Hans",
+                    vec![test_entry(
+                        "welcome",
+                        Translation::Singular("欢迎".to_string()),
+                    )],
+                ),
+                test_resource(
+                    "zh-Hant",
+                    vec![test_entry(
+                        "welcome",
+                        Translation::Singular("歡迎".to_string()),
+                    )],
+                ),
+            ],
+        };
+
+        let report = merge_tolgee_catalog(&mut local, &pulled, &["zh-Hans".to_string()]).unwrap();
+
+        assert_eq!(report.merged, 1);
+        assert_eq!(
+            local
+                .find_entry("welcome", "zh-Hans")
+                .map(|entry| &entry.value),
+            Some(&Translation::Singular("欢迎".to_string()))
+        );
+        assert!(local.get_by_language("zh-Hant").is_none());
+    }
+
+    #[test]
+    fn merge_tolgee_catalog_resolves_bare_language_to_sole_variant() {
+        let mut local = Codec {
+            resources: vec![
+                test_resource(
+                    "en",
+                    vec![test_entry(
+                        "welcome",
+                        Translation::Singular("Welcome".to_string()),
+                    )],
+                ),
+                test_resource("fr", vec![test_entry("welcome", Translation::Empty)]),
+            ],
+        };
+        let pulled = Codec {
+            resources: vec![test_resource(
+                "fr-CA",
+                vec![test_entry(
+                    "welcome",
+                    Translation::Singular("Bienvenue".to_string()),
+                )],
+            )],
+        };
+
+        let report = merge_tolgee_catalog(&mut local, &pulled, &["fr".to_string()]).unwrap();
+
+        assert_eq!(report.merged, 1);
+        assert_eq!(
+            local.find_entry("welcome", "fr").map(|entry| &entry.value),
+            Some(&Translation::Singular("Bienvenue".to_string()))
+        );
+        assert!(local.get_by_language("fr-CA").is_none());
+    }
+
+    #[test]
+    fn merge_tolgee_catalog_rejects_ambiguous_bare_language() {
+        let mut local = Codec {
+            resources: vec![test_resource(
+                "en",
+                vec![test_entry(
+                    "welcome",
+                    Translation::Singular("Welcome".to_string()),
+                )],
+            )],
+        };
+        let pulled = Codec {
+            resources: vec![
+                test_resource(
+                    "fr-FR",
+                    vec![test_entry(
+                        "welcome",
+                        Translation::Singular("Bienvenue".to_string()),
+                    )],
+                ),
+                test_resource(
+                    "fr-CA",
+                    vec![test_entry(
+                        "welcome",
+                        Translation::Singular("Bienvenue".to_string()),
+                    )],
+                ),
+            ],
+        };
+
+        let err = merge_tolgee_catalog(&mut local, &pulled, &["fr".to_string()]).unwrap_err();
+
+        assert_eq!(
+            err,
+            "Tolgee target language 'fr' is ambiguous; matching variants: fr-CA, fr-FR. Specify a fully-qualified target language"
+        );
+        assert!(local.get_by_language("fr-FR").is_none());
+        assert!(local.get_by_language("fr-CA").is_none());
+    }
+
+    #[test]
+    fn merge_tolgee_catalog_prefers_exact_bare_identity_over_variants() {
+        let mut local = Codec {
+            resources: vec![test_resource(
+                "en",
+                vec![test_entry(
+                    "welcome",
+                    Translation::Singular("Welcome".to_string()),
+                )],
+            )],
+        };
+        let pulled = Codec {
+            resources: vec![
+                test_resource(
+                    "fr-CA",
+                    vec![test_entry(
+                        "welcome",
+                        Translation::Singular("Allo".to_string()),
+                    )],
+                ),
+                test_resource(
+                    "fr",
+                    vec![test_entry(
+                        "welcome",
+                        Translation::Singular("Bonjour".to_string()),
+                    )],
+                ),
+                test_resource(
+                    "fr-FR",
+                    vec![test_entry(
+                        "welcome",
+                        Translation::Singular("Salut".to_string()),
+                    )],
+                ),
+            ],
+        };
+
+        let report = merge_tolgee_catalog(&mut local, &pulled, &["fr".to_string()]).unwrap();
+
+        assert_eq!(report.merged, 1);
+        assert_eq!(
+            local.find_entry("welcome", "fr").map(|entry| &entry.value),
+            Some(&Translation::Singular("Bonjour".to_string()))
+        );
+        assert!(local.get_by_language("fr-CA").is_none());
+        assert!(local.get_by_language("fr-FR").is_none());
+    }
+
+    #[test]
+    fn merge_tolgee_catalog_reuses_normalized_local_identity() {
+        let mut local = Codec {
+            resources: vec![
+                test_resource(
+                    "en",
+                    vec![test_entry(
+                        "welcome",
+                        Translation::Singular("Welcome".to_string()),
+                    )],
+                ),
+                test_resource("fr_CA", vec![test_entry("welcome", Translation::Empty)]),
+            ],
+        };
+        let pulled = Codec {
+            resources: vec![test_resource(
+                "fr-CA",
+                vec![test_entry(
+                    "welcome",
+                    Translation::Singular("Bienvenue".to_string()),
+                )],
+            )],
+        };
+
+        let report = merge_tolgee_catalog(&mut local, &pulled, &["FR-ca".to_string()]).unwrap();
+
+        assert_eq!(report.merged, 1);
+        assert_eq!(
+            local
+                .resources
+                .iter()
+                .filter(|resource| { language_identity_eq(&resource.metadata.language, "fr-CA") })
+                .count(),
+            1
+        );
+        assert_eq!(
+            local
+                .find_entry("welcome", "fr_CA")
+                .map(|entry| &entry.value),
+            Some(&Translation::Singular("Bienvenue".to_string()))
+        );
+    }
+
+    #[test]
+    fn merge_tolgee_catalog_rejects_duplicate_normalized_identities_deterministically() {
+        let mut local = Codec {
+            resources: vec![
+                test_resource("fr_CA", Vec::new()),
+                test_resource("fr-CA", Vec::new()),
+            ],
+        };
+        let pulled = Codec::new();
+
+        let err = merge_tolgee_catalog(&mut local, &pulled, &[]).unwrap_err();
+
+        assert_eq!(
+            err,
+            "Local catalog contains duplicate normalized language identities: fr-ca (fr-CA, fr_CA)"
+        );
+    }
+
+    #[test]
+    fn merge_tolgee_catalog_rejects_duplicate_pulled_identities_before_merging() {
+        let mut local = Codec {
+            resources: vec![test_resource(
+                "en",
+                vec![test_entry(
+                    "welcome",
+                    Translation::Singular("Welcome".to_string()),
+                )],
+            )],
+        };
+        let pulled = Codec {
+            resources: vec![
+                test_resource(
+                    "zh_Hans",
+                    vec![test_entry(
+                        "welcome",
+                        Translation::Singular("欢迎".to_string()),
+                    )],
+                ),
+                test_resource(
+                    "zh-Hans",
+                    vec![test_entry(
+                        "welcome",
+                        Translation::Singular("您好".to_string()),
+                    )],
+                ),
+            ],
+        };
+
+        let err = merge_tolgee_catalog(&mut local, &pulled, &[]).unwrap_err();
+
+        assert_eq!(
+            err,
+            "Pulled Tolgee catalog contains duplicate normalized language identities: zh-hans (zh-Hans, zh_Hans)"
+        );
+        assert!(local.get_by_language("zh-Hans").is_none());
+        assert!(local.get_by_language("zh_Hans").is_none());
     }
 
     #[test]

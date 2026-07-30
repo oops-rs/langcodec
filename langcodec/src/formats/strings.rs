@@ -2,11 +2,9 @@
 //!
 //! Provides parsing, serialization, and conversion to/from the internal `Resource` model.
 
-use std::collections::HashMap;
-use std::fs::File;
-// keep imports minimal; actual Read trait is used via fully qualified call above
-use std::path::Path;
+use std::{collections::HashMap, fs::File, io::Read, path::Path};
 
+use encoding_rs::{UTF_8, UTF_16BE, UTF_16LE};
 use indoc::indoc;
 
 use crate::{
@@ -88,17 +86,16 @@ impl Parser for Format {
     where
         Self: Sized,
     {
-        let file = File::open(path).map_err(Error::Io)?;
-        // Auto-detect BOM, decode to UTF-8; passthrough UTF-8
-        let mut decoder = encoding_rs_io::DecodeReaderBytesBuilder::new()
-            .bom_override(true)
-            .build(file);
+        let path = path.as_ref();
+        let result = (|| {
+            let mut file = File::open(path).map_err(Error::Io)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(Error::Io)?;
+            let decoded = decode_file_contents(&bytes)?;
+            Self::from_str(&decoded)
+        })();
 
-        let mut decoded_bytes = Vec::new();
-        std::io::Read::read_to_end(&mut decoder, &mut decoded_bytes).map_err(Error::Io)?;
-        let decoded = String::from_utf8(decoded_bytes)
-            .map_err(|_| Error::InvalidResource("Invalid UTF-8 in .strings file".to_string()))?;
-        Self::from_str(&decoded)
+        result.map_err(|error| error.with_path(path))
     }
 }
 
@@ -174,6 +171,26 @@ impl Pair {
 // ----------------------
 // Internal helpers
 // ----------------------
+
+fn decode_file_contents(bytes: &[u8]) -> Result<String, Error> {
+    let (encoding, payload, encoding_name) =
+        if let Some(payload) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+            (UTF_8, payload, "UTF-8")
+        } else if let Some(payload) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+            (UTF_16LE, payload, "UTF-16LE")
+        } else if let Some(payload) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+            (UTF_16BE, payload, "UTF-16BE")
+        } else {
+            (UTF_8, bytes, "UTF-8")
+        };
+
+    encoding
+        .decode_without_bom_handling_and_without_replacement(payload)
+        .map(|decoded| decoded.into_owned())
+        .ok_or_else(|| {
+            Error::InvalidResource(format!("Invalid {encoding_name} encoding in .strings file"))
+        })
+}
 
 fn parse_strings_content(content: &str) -> (Vec<Pair>, Vec<String>) {
     let bytes = content.as_bytes();

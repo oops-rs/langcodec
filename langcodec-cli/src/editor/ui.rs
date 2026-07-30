@@ -180,10 +180,7 @@ fn render_translations(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(" Key  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    key.as_str(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(key.as_str(), Style::default().add_modifier(Modifier::BOLD)),
             ])),
             Rect {
                 x: inner.x,
@@ -364,10 +361,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                         truncate_path(&app.file_path, 40),
                         Style::default().fg(Color::DarkGray),
                     ),
-                    Span::styled(
-                        format!("  {hint}"),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(format!("  {hint}"), Style::default().fg(Color::DarkGray)),
                 ]))
                 .block(
                     Block::default()
@@ -416,48 +410,32 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
         InputMode::ConfirmQuit => {
             frame.render_widget(
-                Paragraph::new(
-                    " Unsaved changes — [y] Save & quit   [n] Quit   [Esc] Cancel",
-                )
-                .style(
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(
-                            Style::default()
-                                .fg(Color::Red)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                ),
+                Paragraph::new(" Unsaved changes — [y] Save & quit   [n] Quit   [Esc] Cancel")
+                    .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(
+                                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            ),
+                    ),
                 area,
             );
         }
 
         InputMode::ConfirmDelete => {
             let key_name = app.selected_key().unwrap_or("<unknown>");
-            let msg = format!(
-                " Delete key '{key_name}'?   [y] Yes   [n] No   [Esc] Cancel"
-            );
+            let msg = format!(" Delete key '{key_name}'?   [y] Yes   [n] No   [Esc] Cancel");
             frame.render_widget(
                 Paragraph::new(msg)
-                    .style(
-                        Style::default()
-                            .fg(Color::Red)
-                            .add_modifier(Modifier::BOLD),
-                    )
+                    .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
                             .border_type(BorderType::Rounded)
                             .border_style(
-                                Style::default()
-                                    .fg(Color::Red)
-                                    .add_modifier(Modifier::BOLD),
+                                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                             ),
                     ),
                 area,

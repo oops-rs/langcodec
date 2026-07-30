@@ -1,9 +1,23 @@
 use std::fs;
 use std::process::Command;
+
+use langcodec::{Codec, ReadOptions, Translation};
 use tempfile::TempDir;
 
 fn langcodec_cmd() -> Command {
     Command::new(assert_cmd::cargo::cargo_bin!("langcodec"))
+}
+
+fn singular_value<'a>(codec: &'a Codec, language: &str, key: &str) -> Option<&'a str> {
+    let entry = codec
+        .resources
+        .iter()
+        .find(|resource| resource.metadata.language == language)?
+        .find_entry(key)?;
+    match &entry.value {
+        Translation::Singular(value) => Some(value),
+        Translation::Empty | Translation::Plural(_) => None,
+    }
 }
 
 #[test]
@@ -51,11 +65,25 @@ keep_me,Keep me,Reste pareil
     );
     assert!(output.exists());
 
-    let synced = fs::read_to_string(&output).unwrap();
-    assert!(synced.contains("Welcome,Welcome,Bienvenue"));
-    assert!(synced.contains("goodbye,Goodbye,Au revoir"));
-    assert!(synced.contains("keep_me,Keep me,Reste pareil"));
-    assert!(!synced.contains("new_only"));
+    let mut synced = Codec::new();
+    synced
+        .read_file_by_extension_with_options(&output, &ReadOptions::new())
+        .unwrap();
+    assert_eq!(singular_value(&synced, "en", "Welcome"), Some("Welcome"));
+    assert_eq!(singular_value(&synced, "fr", "Welcome"), Some("Bienvenue"));
+    assert_eq!(singular_value(&synced, "en", "goodbye"), Some("Goodbye"));
+    assert_eq!(singular_value(&synced, "fr", "goodbye"), Some("Au revoir"));
+    assert_eq!(singular_value(&synced, "en", "keep_me"), Some("Keep me"));
+    assert_eq!(
+        singular_value(&synced, "fr", "keep_me"),
+        Some("Reste pareil")
+    );
+    assert!(
+        synced
+            .resources
+            .iter()
+            .all(|resource| resource.find_entry("new_only").is_none())
+    );
 }
 
 #[test]
