@@ -5,7 +5,7 @@
 
 use quick_xml::{
     Reader, Writer,
-    events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event},
+    events::{BytesCData, BytesDecl, BytesEnd, BytesStart, BytesText, Event},
 };
 use serde::Serialize;
 use std::{
@@ -397,6 +397,7 @@ fn parse_string_resource<R: BufRead>(
             Ok(Event::Text(e)) => {
                 value.push_str(e.unescape().map_err(Error::XmlParse)?.as_ref());
             }
+            Ok(Event::CData(e)) => value.push_str(&decode_cdata(&e)?),
             Ok(Event::End(ref end)) if end.name().as_ref() == b"string" => break,
             Ok(Event::Eof) => return Err(Error::InvalidResource("Unexpected EOF".to_string())),
             Ok(_) => (),
@@ -426,6 +427,15 @@ fn parse_string_resource<R: BufRead>(
         translatable,
         comment: None,
     })
+}
+
+/// CDATA content is literal text: `<![CDATA[<b>x</b>]]>` and `&lt;b&gt;x&lt;/b&gt;`
+/// are the same Android string, so it joins the value without unescaping.
+fn decode_cdata(cdata: &BytesCData) -> Result<String, Error> {
+    cdata
+        .decode()
+        .map(|text| text.into_owned())
+        .map_err(|error| Error::XmlParse(error.into()))
 }
 
 fn parse_plurals_resource<R: BufRead>(
@@ -473,6 +483,7 @@ fn parse_plurals_resource<R: BufRead>(
                         Ok(Event::Text(e)) => {
                             value.push_str(e.unescape().map_err(Error::XmlParse)?.as_ref());
                         }
+                        Ok(Event::CData(e)) => value.push_str(&decode_cdata(&e)?),
                         Ok(Event::End(ref end)) if end.name().as_ref() == b"item" => break,
                         Ok(Event::Eof) => {
                             return Err(Error::InvalidResource(
@@ -622,6 +633,32 @@ World
         assert_eq!(format.strings[0].name, "hello");
         assert_eq!(format.plurals[0].name, "apples");
         assert_eq!(format.plurals[0].items.len(), 2);
+    }
+
+    #[test]
+    fn cdata_sections_are_part_of_string_and_plural_values() {
+        let xml = r#"
+        <resources>
+            <string name="tip"><![CDATA[Leave? You <b>lose</b> %1$d coins]]></string>
+            <string name="mixed">Hi <![CDATA[<i>%1$s</i>]]> &amp; bye</string>
+            <plurals name="coins">
+                <item quantity="other"><![CDATA[%d <b>coins</b>]]></item>
+            </plurals>
+        </resources>
+        "#;
+        let format = Format::from_str(xml).unwrap();
+        assert_eq!(format.strings[0].value, "Leave? You <b>lose</b> %1$d coins");
+        assert_eq!(format.strings[1].value, "Hi <i>%1$s</i> & bye");
+        assert_eq!(format.plurals[0].items[0].value, "%d <b>coins</b>");
+
+        let mut written = Vec::new();
+        format.to_writer(&mut written).unwrap();
+        let reparsed = Format::from_str(std::str::from_utf8(&written).unwrap()).unwrap();
+        assert_eq!(reparsed.strings[0].value, format.strings[0].value);
+        assert_eq!(
+            reparsed.plurals[0].items[0].value,
+            format.plurals[0].items[0].value
+        );
     }
 
     #[test]
