@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.14.1] - 2026-09-24
+
+### Fixed
+
+- `.xcstrings` items with `"shouldTranslate": false` and localizations keep the
+  flag: entries carry it in the `should_translate` custom key
+  (`formats::xcstrings::SHOULD_TRANSLATE_KEY`) and writing restores it.
+  Previously it was dropped and written back as translatable.
+
 ## [0.14.0] - 2026-09-24
 
 ### Added
