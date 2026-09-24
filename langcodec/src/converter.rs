@@ -385,7 +385,7 @@ pub fn convert_with_normalization<P: AsRef<Path>>(
                         *v = normalize_placeholders(v);
                     }
                     crate::types::Translation::Plural(p) => {
-                        for (_c, v) in p.forms.iter_mut() {
+                        for v in p.forms.values_mut() {
                             *v = normalize_placeholders(v);
                         }
                     }
