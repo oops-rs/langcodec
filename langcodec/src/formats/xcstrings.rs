@@ -189,6 +189,11 @@ impl TryFrom<Format> for Vec<Resource> {
                     is_comment_auto_generated.to_string(),
                 );
             }
+            // Items without localizations become `DoNotTranslate` entries below.
+            // Localized ones keep each value's own state, so the flag travels here.
+            if item.should_translate == Some(false) && !item.localizations.is_empty() {
+                custom.insert(SHOULD_TRANSLATE_KEY.to_string(), "false".to_string());
+            }
 
             if item.localizations.is_empty() {
                 if item.should_translate.unwrap_or(true) {
@@ -337,11 +342,18 @@ pub struct Item {
     pub localizations: HashMap<String, Localization>,
 }
 
+/// Entry custom key carrying `"shouldTranslate": false` for items that also
+/// have localizations; their status keeps the localization's own state.
+pub const SHOULD_TRANSLATE_KEY: &str = "should_translate";
+
 impl Item {
     fn new(entry: Entry, language: String) -> Option<Self> {
         let mut localizations = HashMap::new();
 
-        let should_translate = Some(entry.status != EntryStatus::DoNotTranslate);
+        let should_translate = Some(
+            entry.status != EntryStatus::DoNotTranslate
+                && entry.custom.get(SHOULD_TRANSLATE_KEY).map(String::as_str) != Some("false"),
+        );
 
         match entry.value {
             Translation::Empty => {} // Do nothing
@@ -788,6 +800,35 @@ mod tests {
         );
         assert_eq!(carrom.should_translate, Some(false));
         assert_eq!(carrom.is_comment_auto_generated, Some(true));
+    }
+
+    #[test]
+    fn do_not_translate_items_with_localizations_keep_the_flag_and_state() {
+        let json = r#"{
+          "sourceLanguage" : "en",
+          "strings" : {
+            "brand" : {
+              "shouldTranslate" : false,
+              "localizations" : {
+                "en" : { "stringUnit" : { "state" : "translated", "value" : "WeParty" } }
+              }
+            }
+          },
+          "version" : "1.0"
+        }"#;
+        let format = Format::from_str(json).expect("parse xcstrings");
+        let resources = Vec::<Resource>::try_from(format).expect("resources from xcstrings");
+        let entry = resources[0].find_entry("brand").expect("brand entry");
+        assert_eq!(entry.status, EntryStatus::Translated);
+        assert_eq!(
+            entry.custom.get("should_translate").map(String::as_str),
+            Some("false")
+        );
+
+        let roundtrip = Format::try_from(resources).expect("xcstrings from resources");
+        let brand = roundtrip.strings.get("brand").expect("brand item");
+        assert_eq!(brand.should_translate, Some(false));
+        assert!(brand.localizations.contains_key("en"));
     }
 
     #[test]
