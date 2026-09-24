@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
-## [Unreleased]
+## [0.14.0] - 2026-09-24
 
 ### Added
 
@@ -46,6 +46,17 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - **Breaking:** CSV and TSV `Format` values now contain private schema state.
   Downstream callers must use `new` or `with_records` instead of struct
   literals.
+
+### Fixed
+
+- Android `strings.xml` values written as `<![CDATA[...]]>` are no longer read
+  as empty strings, so conversions keep their text.
+- Placeholder signatures treat a percent sign followed by a space and a word
+  (`5% bonus`, `50% off`) as prose instead of a space-flag conversion, which
+  removed false argument mismatches between languages.
+- `.strings` input read from bytes or a string (`Parser::from_reader`,
+  `from_str`) now decodes BOM-prefixed UTF-16 and UTF-8 like path reads.
+- Clippy `for_kv_map` on Rust 1.97, which failed the Clippy CI job.
 
 ## [0.13.0] - 2026-05-18
 

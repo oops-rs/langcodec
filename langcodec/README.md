@@ -10,7 +10,7 @@ Universal localization file toolkit for Rust. Parse, write, convert, merge.
 
 ```toml
 [dependencies]
-langcodec = "0.13.0"
+langcodec = "0.14.0"
 ```
 
 Docs: <https://docs.rs/langcodec>
