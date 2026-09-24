@@ -2,7 +2,7 @@
 //!
 //! Provides parsing, serialization, and conversion to/from the internal `Resource` model.
 
-use std::{collections::HashMap, fs::File, io::Read, path::Path};
+use std::collections::HashMap;
 
 use encoding_rs::{UTF_8, UTF_16BE, UTF_16LE};
 use indoc::indoc;
@@ -30,12 +30,12 @@ impl Parser for Format {
     /// The `language` parameter would be empty, since the .strings format does
     /// not contain any metadata about the language.
     fn from_reader<R: std::io::BufRead>(reader: R) -> Result<Self, Error> {
-        // Read entire input into a string (UTF-8 expected here; UTF-16 handled in read_from)
+        // Apple writes .strings as UTF-16 with a BOM as often as UTF-8, so
+        // byte input is decoded the same way as a file path.
         let mut reader = reader;
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut reader, &mut bytes).map_err(Error::Io)?;
-        let content = String::from_utf8(bytes)
-            .map_err(|_| Error::InvalidResource("Invalid UTF-8 in .strings file".to_string()))?;
+        let content = decode_file_contents(&bytes)?;
 
         // Parse content
         let header_language = extract_header_language(&content).unwrap_or_default();
@@ -79,23 +79,6 @@ impl Parser for Format {
         }
 
         writer.write_all(content.as_bytes()).map_err(Error::Io)
-    }
-
-    /// Override default file reading to support BOM-aware decoding (e.g., UTF-16 Apple .strings)
-    fn read_from<P: AsRef<Path>>(path: P) -> Result<Self, Error>
-    where
-        Self: Sized,
-    {
-        let path = path.as_ref();
-        let result = (|| {
-            let mut file = File::open(path).map_err(Error::Io)?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).map_err(Error::Io)?;
-            let decoded = decode_file_contents(&bytes)?;
-            Self::from_str(&decoded)
-        })();
-
-        result.map_err(|error| error.with_path(path))
     }
 }
 
@@ -794,5 +777,30 @@ mod tests {
         "#;
         let parsed = Format::from_str(content).unwrap();
         assert_eq!(parsed.pairs.len(), 3);
+    }
+
+    #[test]
+    fn from_reader_decodes_utf16_and_utf8_bom_like_read_from() {
+        let text = "\"greeting\" = \"Grüß %@\";\n";
+        let utf16le: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let utf16be: Vec<u8> = [0xFE, 0xFF]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect();
+        let utf8_bom: Vec<u8> = [0xEF, 0xBB, 0xBF].into_iter().chain(text.bytes()).collect();
+        for bytes in [utf16le, utf16be, utf8_bom] {
+            let parsed = Format::from_reader(bytes.as_slice()).unwrap();
+            assert_eq!(parsed.pairs.len(), 1);
+            assert_eq!(parsed.pairs[0].key, "greeting");
+            assert_eq!(parsed.pairs[0].value, "Grüß %@");
+        }
+    }
+
+    #[test]
+    fn from_reader_rejects_utf16_without_valid_code_units() {
+        assert!(Format::from_reader(&[0xFF, 0xFE, 0x00, 0xD8][..]).is_err());
     }
 }
