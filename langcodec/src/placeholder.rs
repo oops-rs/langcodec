@@ -66,6 +66,10 @@ pub fn extract_placeholders(input: &str) -> Vec<PlaceholderToken> {
             i += 2;
             continue;
         }
+        if is_percent_before_word(input, i) {
+            i += 1;
+            continue;
+        }
 
         let mut cursor = i + 1;
         let value_index = parse_positional_index(bytes, &mut cursor);
@@ -192,6 +196,19 @@ pub fn extract_placeholders(input: &str) -> Vec<PlaceholderToken> {
     }
 
     out
+}
+
+/// `5% bonus`, `50% off`, `5% de`: a percent sign, one space and a word of at
+/// least two letters is prose, not a space-flag conversion. Translated strings
+/// with no arguments carry such text in every language, and reading it as
+/// `% b`/`% o`/`% d` reports argument mismatches that no formatter would see.
+/// A space-flag conversion that ends its word (`% d`, `[% d]`) still counts.
+fn is_percent_before_word(input: &str, percent: usize) -> bool {
+    let rest = &input[percent + 1..];
+    let mut chars = rest.chars();
+    chars.next() == Some(' ')
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.next().is_some_and(char::is_alphabetic)
 }
 
 fn parse_positional_index(bytes: &[u8], cursor: &mut usize) -> Option<usize> {
@@ -484,6 +501,25 @@ mod tests {
     fn java_flags_do_not_hide_conversions_or_become_static_width() {
         assert_eq!(signature("%,12d %(08d"), vec!["1$d", "2$d"]);
         assert_eq!(signature("%#b %+d"), vec!["1$b", "2$d"]);
+    }
+
+    #[test]
+    fn percent_sign_followed_by_a_word_is_prose_not_a_space_flag_conversion() {
+        assert_eq!(signature("Get 5% bonus"), Vec::<String>::new());
+        assert_eq!(
+            signature("5% de descuento, 50% off, 100% free, 5% new"),
+            Vec::<String>::new()
+        );
+        assert_eq!(signature("Gana 5% syiling y %d monedas"), vec!["1$d"]);
+        assert_eq!(signature("5% 金币 %@"), vec!["1$s"]);
+    }
+
+    #[test]
+    fn space_flag_conversions_that_end_a_word_remain_arguments() {
+        assert_eq!(signature("% d"), vec!["1$d"]);
+        assert_eq!(signature("[% d] % 5d"), vec!["1$d", "2$d"]);
+        assert_eq!(signature("% d%%"), vec!["1$d"]);
+        assert_eq!(signature("%+dx"), vec!["1$d"]);
     }
 
     #[test]
